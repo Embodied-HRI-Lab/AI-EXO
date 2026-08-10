@@ -1286,7 +1286,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--rescaling",
         type=float,
-        default=5.0,
+        default=6.0,
     )
     p.add_argument(
         "--flex",
