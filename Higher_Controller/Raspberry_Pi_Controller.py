@@ -1,5 +1,5 @@
 """
-Raspberry Pi <-> Teensy communication for bilateral hip exoskeleton.
+PC <-> Teensy communication for bilateral hip exoskeleton.
 
 Current UART protocol
 ---------------------
@@ -870,7 +870,7 @@ def make_constant_torque_controller(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Raspberry Pi <-> Teensy exoskeleton UART controller"
+        description="PC <-> Teensy exoskeleton UART controller"
     )
 
     parser.add_argument(
@@ -922,7 +922,7 @@ def main() -> None:
     parser.add_argument(
         "--rescaling",
         type=float,
-        default=0.0,
+        default=5.0,
         help="Original Rescaling_gain (safe default: 0.0)",
     )
     parser.add_argument(
@@ -955,7 +955,7 @@ def main() -> None:
     parser.add_argument(
         "--max-torque",
         type=float,
-        default=0.20,
+        default=5.0,
         help=(
             "High-level two-side safety threshold in Nm "
             "(must be <= 0.25, default: 0.20)"

@@ -1,82 +1,83 @@
 """
-Samsung PC controller with independent dual IMU threads + Teensy
-====================================================
+PC neural-network controller for bilateral hip exoskeleton
+==========================================================
 
-Purpose
--------
-This version is specifically designed to diagnose intermittent IMU timeout
-without letting plotting or the other IMU reader block the control loop.
-
-Thread/process architecture
----------------------------
-Main thread:
-    - 100 Hz Samsung calculation
-    - 100 Hz command TX to Teensy
-    - 100 Hz CSV logging
-
+Architecture
+------------
 Thread 1:
-    - LEFT IM948 only (COM7)
+    LEFT IM948 on COM8, independent serial reader
 
 Thread 2:
-    - RIGHT IM948 only (COM8)
+    RIGHT IM948 on COM6, independent serial reader
 
 Thread 3:
-    - Teensy RX feedback (COM3)
+    Teensy on COM7, independent torque-feedback reader
 
 Main thread:
-    - 100 Hz Samsung calculation
-    - 100 Hz torque TX to Teensy
-    - 100 Hz compact CSV logging
+    100 Hz
+    - get latest zeroed X angle / X gyro from both IMUs
+    - get latest actual motor torque from Teensy
+    - convert deg / deg/s to rad / rad/s for the NN
+    - run NN inference
+    - send torque command to Teensy
+    - write formal CSV
 
-Optional separate process:
-    - Matplotlib realtime plot
+Optional isolated subprocess:
+    - matplotlib realtime plot
+    - default redraw 30 Hz
+    - 10 s rolling window
 
-Important timeout behavior
---------------------------
-Each IMU has its own sample timestamp and sequence counter.
+Important units
+---------------
+CSV / plot:
+    angle          = deg
+    angular speed  = deg/s
+    torque         = Nm
 
-    age <= 50 ms       : OK
-    50 ms < age <=150  : STALE warning, keep using latest valid sample
-    age > 150 ms       : CONTROL TIMEOUT, Samsung command is forced to zero
+Neural-network input:
+    angle          = rad
+    angular speed  = rad/s
+    torque         = Nm
 
-The display angle is NOT replaced with NaN during timeout. The plot therefore
-stays continuous and you can directly see which IMU is holding its last value.
+This preserves the unit convention used by the original packaged NN models.
 
-Formal CSV keeps only the signals required for experiment recording:
-    elapsed_s
-    left_angle_x_deg / right_angle_x_deg
-    left_angular_velocity_x_dps / right_angular_velocity_x_dps
-    left_actual_torque_nm / right_actual_torque_nm
+Formal CSV
+----------
+elapsed_s
+left_angle_x_deg
+left_angular_velocity_x_dps
+right_angle_x_deg
+right_angular_velocity_x_dps
+left_actual_torque_nm
+right_actual_torque_nm
+left_nn_command_nm
+right_nn_command_nm
 
 All CSV numeric values are written with exactly 4 decimal places.
 
-Startup zero calibration removes:
-    1) the standing X-angle offset;
-    2) the static X-gyro bias.
-
-Samsung control still uses ONLY the standing-zeroed X angle.
-
 Safety
 ------
-Default behavior is calculation/logging only:
-    --enable is NOT set -> Teensy receives 0 Nm and enable=0.
+Without --arm:
+    NN still runs and is plotted/printed, but Teensy receives zero torque.
 
-Only add --enable after communication/timeout behavior is satisfactory.
+With --arm:
+    torque is sent only while both IMUs and Teensy feedback are fresh and the
+    NN output is valid.
 
 Examples
 --------
-Safe print test:
-    python samsung_pc_dual_imu_teensy.py --display print
+Dry-run with terminal:
+    python pc_nn_formal_controller.py --display print
 
-Safe plot test:
-    python samsung_pc_dual_imu_teensy.py --display plot
+Dry-run with realtime plot:
+    python pc_nn_formal_controller.py --display plot
 
-Real torque test (only after diagnostics are satisfactory):
-    python samsung_pc_dual_imu_teensy.py --display plot --enable
+Real torque:
+    python pc_nn_formal_controller.py --display plot --arm
 
 Dependencies
 ------------
-    python -m pip install pyserial matplotlib
+    python -m pip install pyserial matplotlib numpy torch
 """
 
 from __future__ import annotations
@@ -84,19 +85,22 @@ from __future__ import annotations
 import argparse
 import csv
 import math
-import multiprocessing as mp
 import queue
 import struct
+import subprocess
+import sys
 import threading
 import time
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Final
+from typing import Final, Optional
 
+import numpy as np
 import serial
-
+import torch
+from torch import nn
 
 # =============================================================================
 # General configuration
@@ -705,7 +709,7 @@ def relative_x_deg(
     direction_sign: float,
 ) -> float:
     """
-    Unified hip-angle coordinate used everywhere in this program.
+    Unified zeroed X-angle coordinate used by NN, plot, and CSV.
 
     Pipeline:
         IMU raw Euler-X
@@ -714,7 +718,7 @@ def relative_x_deg(
         -> apply side direction sign
 
     The returned value is the ONLY angle allowed to enter:
-        1) Samsung controller
+        1) neural-network input (after rad conversion)
         2) realtime plot / terminal display
         3) CSV logging
 
@@ -851,152 +855,258 @@ def calibrate_initial_x_zero(
     return left_zero, right_zero
 
 
-# =============================================================================
-# Samsung controller
-# =============================================================================
 
-@dataclass
-class SamsungConfig:
-    rescaling: float = 5.0
-    flex_gain: float = 1.0
-    ext_gain: float = 1.0
-    delay_index: int = 0
-    filter_tau_s: float = 0.035
-    max_command_nm: float = 0.20
+Observation = tuple[float, float, float, float, float, float]
+TorqueCommand = tuple[float, float]
+
+# ============================================================
+# 6. Neural-network policy
+# ============================================================
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+DEFAULT_MODEL_FILES = {
+    "direct": SCRIPT_DIR / "direct_exo_8frame.pt",
+    "pd": SCRIPT_DIR / "target_pd_exo_8frame.pt",
+}
 
 
-class SamsungController:
-    """
-    Angle-based Samsung bilateral assistance law using standing-zeroed relative angles.
+class PolicyMLP(nn.Module):
+    def __init__(self, input_dim: int, hidden_dim: int, output_dim: int) -> None:
+        super().__init__()
+        self.network = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, output_dim),
+            nn.Tanh(),
+        )
 
-    gyro-X is not used by the torque law; it is recorded for diagnostics.
-    """
+    def forward(self, value: torch.Tensor) -> torch.Tensor:
+        return self.network(value)
 
-    HISTORY_SIZE = 100
 
-    def __init__(self, cfg: SamsungConfig) -> None:
-        self.cfg = cfg
+class NeuralTorqueInterface:
+    """Stateful 100-Hz inference for either packaged Exo policy."""
 
-        self.left_filtered: float | None = None
-        self.right_filtered: float | None = None
-
-        self.phase_history = [0.0] * self.HISTORY_SIZE
-        self.shape_history = [0.0] * self.HISTORY_SIZE
-
-        self.write_index = 0
-        self.valid_count = 0
-        self.last_time: float | None = None
-
-    def update(
+    def __init__(
         self,
-        left_angle_deg: float,
-        right_angle_deg: float,
-        now: float,
-    ) -> tuple[float, float]:
-        # Inputs are already standing-zeroed, wrapped, and direction-normalized.
-        left = math.radians(left_angle_deg)
-        right = math.radians(right_angle_deg)
+        policy_type: str,
+        model_path: Optional[Path] = None,
+    ) -> None:
+        self.policy_type = policy_type
+        self.model_path = model_path or DEFAULT_MODEL_FILES[policy_type]
+        self.model: Optional[PolicyMLP] = None
+        self.load_message = ""
+        self.last_error = ""
+        self.calls = 0
+        self.valid_outputs = 0
+        self.history: deque[np.ndarray] = deque()
+        self.previous_nm = np.zeros(2, dtype=np.float32)
+        self._load()
 
-        if self.last_time is None:
-            dt = 1.0 / DEFAULT_CONTROL_HZ
-        else:
-            dt = max(0.001, min(now - self.last_time, 0.05))
+    @property
+    def available(self) -> bool:
+        return self.model is not None
 
-        self.last_time = now
-
-        if self.left_filtered is None:
-            self.left_filtered = left
-            self.right_filtered = right
-        else:
-            alpha = 1.0 - math.exp(
-                -dt / self.cfg.filter_tau_s
+    def _load(self) -> None:
+        try:
+            payload = torch.load(
+                self.model_path, map_location="cpu", weights_only=False
             )
-
-            self.left_filtered += alpha * (
-                left - self.left_filtered
+            self.history_steps = int(payload["history_steps"])
+            self.input_mean = np.asarray(
+                payload["input_mean"], dtype=np.float32
             )
-            assert self.right_filtered is not None
-            self.right_filtered += alpha * (
-                right - self.right_filtered
+            self.input_std = np.asarray(
+                payload["input_std"], dtype=np.float32
             )
-
-        assert self.right_filtered is not None
-
-        phase = self.right_filtered - self.left_filtered
-        shape = (
-            math.sin(self.right_filtered)
-            - math.sin(self.left_filtered)
+            self.torque_scale_nm = float(payload.get("torque_scale_nm", 10.0))
+            self.max_delta_nm = float(payload["max_delta_nm_per_step"])
+            output_dim = 2 if self.policy_type == "direct" else 1
+            self.model = PolicyMLP(
+                len(self.input_mean), int(payload["hidden_dim"]), output_dim
+            )
+            self.model.load_state_dict(payload["state_dict"])
+            self.model.eval()
+            if self.policy_type == "pd":
+                self.kp = float(payload["kp_nm_per_rad"])
+                self.kd = float(payload["kd_nm_s_per_rad"])
+                self.offset_limit = float(payload["target_offset_limit_rad"])
+                self.torque_limit_nm = float(payload["torque_limit_nm"])
+        except Exception as exc:
+            self.load_message = (
+                f"Failed to load {self.policy_type} model "
+                f"'{self.model_path}': {exc}. "
+                "The controller will output zero torque."
+            )
+            self.model = None
+            return
+        self.load_message = (
+            f"Loaded {self.policy_type} Exo policy: {self.model_path}"
         )
 
-        current_index = self.write_index
-        self.phase_history[current_index] = phase
-        self.shape_history[current_index] = shape
+    def reset(self) -> None:
+        self.history.clear()
+        self.previous_nm.fill(0.0)
 
-        self.write_index = (
-            self.write_index + 1
-        ) % self.HISTORY_SIZE
+    def zero_state_test(self, steps: int = 40) -> Optional[TorqueCommand]:
+        """
+        Evaluate the packaged policy at an exact stationary zero state.
 
-        self.valid_count = min(
-            self.valid_count + 1,
-            self.HISTORY_SIZE,
-        )
+        The test deliberately runs multiple 100-Hz-equivalent inference steps
+        because the packaged policy contains its own per-step torque limiter.
+        The policy state and diagnostic counters are restored afterward.
+        """
+        old_calls = self.calls
+        old_valid_outputs = self.valid_outputs
+        old_error = self.last_error
 
-        delay = max(
-            0,
-            min(self.cfg.delay_index, self.HISTORY_SIZE - 1),
-        )
+        self.reset()
+        result: Optional[TorqueCommand] = None
 
-        if self.valid_count <= delay:
-            return 0.0, 0.0
+        for _ in range(max(int(steps), self.history_steps, 1)):
+            result = self.get_torque((0.0, 0.0, 0.0, 0.0, 0.0, 0.0))
+            if result is None:
+                break
 
-        delayed_index = (
-            current_index - delay
-        ) % self.HISTORY_SIZE
+        self.reset()
+        self.calls = old_calls
+        self.valid_outputs = old_valid_outputs
+        test_error = self.last_error
+        self.last_error = old_error
 
-        delayed_phase = self.phase_history[delayed_index]
-        delayed_shape = self.shape_history[delayed_index]
+        if result is None and test_error:
+            print(f"[NN ZERO TEST ERROR] {test_error}")
 
-        phase_limit = math.radians(120.0)
+        return result
 
-        if 0.0 <= delayed_phase < phase_limit:
-            left_tau = (
-                -self.cfg.rescaling
-                * self.cfg.ext_gain
-                * delayed_shape
-            )
-            right_tau = (
-                self.cfg.rescaling
-                * self.cfg.flex_gain
-                * delayed_shape
-            )
-
-        elif -phase_limit < delayed_phase < 0.0:
-            right_tau = (
-                self.cfg.rescaling
-                * self.cfg.ext_gain
-                * delayed_shape
-            )
-            left_tau = (
-                -self.cfg.rescaling
-                * self.cfg.flex_gain
-                * delayed_shape
-            )
-
+    def _append_history(self, frame: np.ndarray) -> np.ndarray:
+        if not self.history:
+            for _ in range(self.history_steps):
+                self.history.append(frame.copy())
         else:
-            left_tau = 0.0
-            right_tau = 0.0
+            self.history.append(frame.copy())
+            while len(self.history) > self.history_steps:
+                self.history.popleft()
+        return np.stack(self.history)
 
-        limit = abs(self.cfg.max_command_nm)
+    def _limit(self, desired_nm: np.ndarray) -> np.ndarray:
+        applied = np.clip(
+            desired_nm,
+            self.previous_nm - self.max_delta_nm,
+            self.previous_nm + self.max_delta_nm,
+        )
+        self.previous_nm = np.clip(applied, -10.0, 10.0).astype(np.float32)
+        return self.previous_nm.copy()
 
-        left_tau = max(-limit, min(limit, left_tau))
-        right_tau = max(-limit, min(limit, right_tau))
+    def _infer_right_left(self, observation: Observation) -> np.ndarray:
+        (
+            left_actual_nm,
+            right_actual_nm,
+            left_angle,
+            left_velocity,
+            right_angle,
+            right_velocity,
+        ) = observation
+        hip4 = np.asarray(
+            [right_angle, left_angle, right_velocity, left_velocity],
+            dtype=np.float32,
+        )
 
-        return left_tau, right_tau
+        if self.policy_type == "direct":
+            history = self._append_history(hip4)
+            features = history.reshape(-1)
+            normalized = torch.from_numpy(
+                (features - self.input_mean) / self.input_std
+            )[None]
+            with torch.inference_mode():
+                desired_nm = (
+                    self.torque_scale_nm * self.model(normalized)[0].numpy()
+                )
+            return self._limit(desired_nm)
+
+        actual_normalized = np.asarray(
+            [right_actual_nm, left_actual_nm], dtype=np.float32
+        ) / self.torque_scale_nm
+        history = self._append_history(
+            np.concatenate((hip4, actual_normalized))
+        )
+        right_features = history.reshape(-1)
+        left_features = history[:, [1, 0, 3, 2, 5, 4]].reshape(-1)
+        features = np.stack((right_features, left_features))
+        normalized = torch.from_numpy(
+            (features - self.input_mean) / self.input_std
+        )
+        with torch.inference_mode():
+            offset = self.offset_limit * self.model(normalized)[:, 0].numpy()
+        desired_nm = np.clip(
+            self.kp * offset + self.kd * hip4[2:],
+            -self.torque_limit_nm,
+            self.torque_limit_nm,
+        )
+        return self._limit(desired_nm)
+
+    def get_torque(
+        self,
+        observation: Observation,
+    ) -> Optional[TorqueCommand]:
+        """
+        Return a valid (left_nm, right_nm), or None.
+
+        None means:
+            no neural-network torque is currently available.
+        """
+        if self.model is None:
+            return None
+
+        self.calls += 1
+
+        try:
+            right_left = self._infer_right_left(observation)
+            result = (float(right_left[1]), float(right_left[0]))
+        except Exception as exc:
+            self.last_error = (
+                f"{type(exc).__name__}: {exc}"
+            )
+            return None
+
+        if result is None:
+            self.last_error = ""
+            return None
+
+        try:
+            if len(result) != 2:
+                raise ValueError(
+                    "Output must contain exactly two torque values."
+                )
+
+            left = float(result[0])
+            right = float(result[1])
+
+            if not math.isfinite(left) or not math.isfinite(right):
+                raise ValueError("Output contains NaN or Inf.")
+
+        except Exception as exc:
+            self.last_error = (
+                f"Invalid neural output: {type(exc).__name__}: {exc}"
+            )
+            return None
+
+        self.last_error = ""
+        self.valid_outputs += 1
+        return left, right
+
 
 
 # =============================================================================
-# Plot process
+# Realtime plot subprocess client
 # =============================================================================
+
+PLOT_HELPER_PATH = Path(__file__).resolve().with_name(
+    "pc_nn_plot_worker.py"
+)
+
 
 def sample_state(
     age_s: float,
@@ -1010,182 +1120,197 @@ def sample_state(
     return "OK"
 
 
-def plot_worker(
-    data_queue,
-    close_event,
-    *,
-    refresh_hz: float,
-    window_s: float,
-    stale_warning_s: float,
-    imu_timeout_s: float,
-) -> None:
-    import matplotlib.pyplot as plt
+class PlotSubprocess:
+    """
+    Realtime plotting isolated in a completely separate Python program.
 
-    history_len = max(
-        int(window_s * DEFAULT_CONTROL_HZ * 1.5),
-        300,
-    )
+    Why:
+        Windows multiprocessing uses spawn, which re-imports this controller
+        module in the child process. Since this module imports torch, that can
+        initialize Intel OpenMP a second time and trigger OMP Error #15.
 
-    t_hist = deque(maxlen=history_len)
-    la_hist = deque(maxlen=history_len)
-    ra_hist = deque(maxlen=history_len)
+    This class launches pc_nn_plot_worker.py with subprocess.Popen instead.
+    The helper imports matplotlib but never imports torch or this controller.
 
-    lc_hist = deque(maxlen=history_len)
-    rc_hist = deque(maxlen=history_len)
-    lactual_hist = deque(maxlen=history_len)
-    ractual_hist = deque(maxlen=history_len)
+    Control-loop safety:
+        - main control thread never writes to the pipe directly
+        - samples enter a bounded queue with put_nowait()
+        - a dedicated feeder thread writes text lines to the child stdin
+        - if plotting falls behind, display samples are dropped
+        - NN/control/TX/CSV remain independent
+    """
 
-    fig, (ax_angle, ax_torque) = plt.subplots(
-        2,
-        1,
-        sharex=True,
-        figsize=(11, 7),
-    )
+    def __init__(
+        self,
+        *,
+        refresh_hz: float,
+        window_s: float,
+        stale_warning_s: float,
+        imu_timeout_s: float,
+        teensy_timeout_s: float,
+    ) -> None:
+        self.refresh_hz = float(refresh_hz)
+        self.window_s = float(window_s)
+        self.stale_warning_s = float(stale_warning_s)
+        self.imu_timeout_s = float(imu_timeout_s)
+        self.teensy_timeout_s = float(teensy_timeout_s)
 
-    line_la, = ax_angle.plot([], [], label="Left relative angle")
-    line_ra, = ax_angle.plot([], [], label="Right relative angle")
-    ax_angle.axhline(0.0, linewidth=0.8)
-    ax_angle.set_ylabel("Relative hip angle (deg)")
-    ax_angle.set_title("Standing-zeroed relative hip angle")
-    ax_angle.legend(loc="upper right")
-    ax_angle.grid(True, alpha=0.25)
+        self.queue: queue.Queue = queue.Queue(maxsize=400)
+        self.process: Optional[subprocess.Popen] = None
+        self.feeder_thread: Optional[threading.Thread] = None
+        self.feeder_error: Optional[str] = None
 
-    line_lc, = ax_torque.plot([], [], label="Left command")
-    line_rc, = ax_torque.plot([], [], label="Right command")
-    line_lactual, = ax_torque.plot([], [], label="Left actual")
-    line_ractual, = ax_torque.plot([], [], label="Right actual")
-    ax_torque.set_ylabel("Torque (Nm)")
-    ax_torque.set_xlabel("Elapsed time (s)")
-    ax_torque.legend(loc="upper right")
-    ax_torque.grid(True, alpha=0.25)
+    @property
+    def closed(self) -> bool:
+        return (
+            self.process is not None
+            and self.process.poll() is not None
+        )
 
-    status_text = fig.suptitle("Waiting for samples...")
+    def start(self) -> None:
+        if not PLOT_HELPER_PATH.exists():
+            raise FileNotFoundError(
+                "Realtime plot helper not found: "
+                f"{PLOT_HELPER_PATH}. "
+                "Keep pc_nn_plot_worker.py beside this controller."
+            )
 
-    latest_left_age = math.inf
-    latest_right_age = math.inf
-    latest_control_ok = False
+        command = [
+            sys.executable,
+            str(PLOT_HELPER_PATH),
+            "--refresh-hz",
+            str(self.refresh_hz),
+            "--window-s",
+            str(self.window_s),
+            "--stale-warning-s",
+            str(self.stale_warning_s),
+            "--imu-timeout-s",
+            str(self.imu_timeout_s),
+            "--teensy-timeout-s",
+            str(self.teensy_timeout_s),
+        ]
 
-    def on_close(_event) -> None:
-        close_event.set()
+        self.process = subprocess.Popen(
+            command,
+            stdin=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
 
-    fig.canvas.mpl_connect("close_event", on_close)
+        self.feeder_thread = threading.Thread(
+            target=self._feeder_loop,
+            name="PlotPipeFeeder",
+            daemon=True,
+        )
+        self.feeder_thread.start()
 
-    refresh_period = 1.0 / max(refresh_hz, 1.0)
-    next_refresh = time.perf_counter()
+    def _feeder_loop(self) -> None:
+        try:
+            while True:
+                item = self.queue.get()
 
-    while not close_event.is_set():
-        got_any = False
+                if item is None:
+                    break
 
-        while True:
+                process = self.process
+                if process is None or process.poll() is not None:
+                    break
+
+                if process.stdin is None:
+                    break
+
+                # Tab-separated lightweight streaming protocol:
+                # elapsed, Langle, Rangle, Lcmd, Rcmd, Lact, Ract,
+                # Lage, Rage, Tage, control_ok, enabled
+                line = "\t".join(
+                    (
+                        f"{float(item[0]):.9f}",
+                        f"{float(item[1]):.9f}",
+                        f"{float(item[2]):.9f}",
+                        f"{float(item[3]):.9f}",
+                        f"{float(item[4]):.9f}",
+                        f"{float(item[5]):.9f}",
+                        f"{float(item[6]):.9f}",
+                        f"{float(item[7]):.9f}",
+                        f"{float(item[8]):.9f}",
+                        f"{float(item[9]):.9f}",
+                        "1" if bool(item[10]) else "0",
+                        "1" if bool(item[11]) else "0",
+                    )
+                )
+
+                process.stdin.write(line + "\n")
+                process.stdin.flush()
+
+        except (BrokenPipeError, OSError) as exc:
+            # Normal when the user closes the plot window.
+            self.feeder_error = f"{type(exc).__name__}: {exc}"
+        except Exception as exc:
+            self.feeder_error = f"{type(exc).__name__}: {exc}"
+
+    def push(self, sample) -> None:
+        """
+        Non-blocking from the 100-Hz main control loop.
+        Drop the oldest display sample if the plot queue is full.
+        """
+        if self.closed:
+            return
+
+        try:
+            self.queue.put_nowait(sample)
+            return
+        except queue.Full:
+            pass
+
+        try:
+            self.queue.get_nowait()
+        except queue.Empty:
+            pass
+
+        try:
+            self.queue.put_nowait(sample)
+        except queue.Full:
+            pass
+
+    def stop(self) -> None:
+        try:
+            self.queue.put_nowait(None)
+        except queue.Full:
             try:
-                item = data_queue.get_nowait()
+                self.queue.get_nowait()
             except queue.Empty:
-                break
+                pass
+            try:
+                self.queue.put_nowait(None)
+            except queue.Full:
+                pass
 
-            if item is None:
-                close_event.set()
-                break
+        if (
+            self.feeder_thread is not None
+            and self.feeder_thread.is_alive()
+        ):
+            self.feeder_thread.join(timeout=1.0)
 
-            (
-                elapsed,
-                left_angle,
-                right_angle,
-                left_cmd,
-                right_cmd,
-                left_actual,
-                right_actual,
-                left_age_s,
-                right_age_s,
-                control_ok,
-            ) = item
+        process = self.process
+        if process is None:
+            return
 
-            t_hist.append(elapsed)
-            la_hist.append(left_angle)
-            ra_hist.append(right_angle)
+        try:
+            if process.stdin is not None:
+                process.stdin.close()
+        except Exception:
+            pass
 
-            lc_hist.append(left_cmd)
-            rc_hist.append(right_cmd)
-            lactual_hist.append(left_actual)
-            ractual_hist.append(right_actual)
-
-            latest_left_age = left_age_s
-            latest_right_age = right_age_s
-            latest_control_ok = control_ok
-            got_any = True
-
-        now = time.perf_counter()
-
-        if got_any and now >= next_refresh and len(t_hist) >= 2:
-            x = list(t_hist)
-
-            line_la.set_data(x, list(la_hist))
-            line_ra.set_data(x, list(ra_hist))
-
-            line_lc.set_data(x, list(lc_hist))
-            line_rc.set_data(x, list(rc_hist))
-            line_lactual.set_data(x, list(lactual_hist))
-            line_ractual.set_data(x, list(ractual_hist))
-
-            xmax = x[-1]
-            xmin = max(x[0], xmax - window_s)
-
-            ax_angle.set_xlim(xmin, max(xmax, xmin + 0.1))
-            ax_torque.set_xlim(xmin, max(xmax, xmin + 0.1))
-
-            # Autoscale y only; keep the requested rolling x-window.
-            ax_angle.relim()
-            ax_angle.autoscale_view(scalex=False, scaley=True)
-
-            ax_torque.relim()
-            ax_torque.autoscale_view(scalex=False, scaley=True)
-
-            left_state = sample_state(
-                latest_left_age,
-                stale_warning_s,
-                imu_timeout_s,
-            )
-            right_state = sample_state(
-                latest_right_age,
-                stale_warning_s,
-                imu_timeout_s,
-            )
-
-            status_text.set_text(
-                f"L age={latest_left_age * 1000:5.1f} ms [{left_state}]  |  "
-                f"R age={latest_right_age * 1000:5.1f} ms [{right_state}]  |  "
-                f"control={'OK' if latest_control_ok else 'ZERO'}"
-            )
-
-            fig.canvas.draw_idle()
-            fig.canvas.flush_events()
-
-            next_refresh = now + refresh_period
-
-        plt.pause(0.001)
-
-    try:
-        plt.close(fig)
-    except Exception:
-        pass
-
-
-def push_plot_sample(data_queue, sample) -> None:
-    """Plotting can lose display samples, but it must never block control."""
-    try:
-        data_queue.put_nowait(sample)
-        return
-    except queue.Full:
-        pass
-
-    try:
-        data_queue.get_nowait()
-    except queue.Empty:
-        pass
-
-    try:
-        data_queue.put_nowait(sample)
-    except queue.Full:
-        pass
+        if process.poll() is None:
+            try:
+                process.wait(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                process.terminate()
+                try:
+                    process.wait(timeout=1.0)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=1.0)
 
 
 # =============================================================================
@@ -1195,40 +1320,27 @@ def push_plot_sample(data_queue, sample) -> None:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description=(
-            "Samsung controller with independent IMU threads "
-            "and timeout diagnostics"
+            "100-Hz PC neural-network controller with independent dual IMUs "
+            "and simplified 14-byte Teensy torque feedback"
         )
     )
 
-    p.add_argument(
-        "--left-port",
-        default=DEFAULT_LEFT_IMU_PORT,
-    )
-    p.add_argument(
-        "--right-port",
-        default=DEFAULT_RIGHT_IMU_PORT,
-    )
-    p.add_argument(
-        "--teensy-port",
-        default=DEFAULT_TEENSY_PORT,
-    )
-    p.add_argument(
-        "--baud",
-        type=int,
-        default=DEFAULT_BAUD,
-    )
+    p.add_argument("--left-port", default=DEFAULT_LEFT_IMU_PORT)
+    p.add_argument("--right-port", default=DEFAULT_RIGHT_IMU_PORT)
+    p.add_argument("--teensy-port", default=DEFAULT_TEENSY_PORT)
+    p.add_argument("--baud", type=int, default=DEFAULT_BAUD)
 
     p.add_argument(
         "--rate",
         type=float,
         default=DEFAULT_CONTROL_HZ,
+        help="NN/control/TX/CSV rate; packaged policies require 100 Hz",
     )
 
     p.add_argument(
         "--display",
         choices=("print", "plot"),
         default="print",
-        help="print or realtime plot; mutually exclusive",
     )
     p.add_argument(
         "--print-rate",
@@ -1250,13 +1362,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--stale-warning",
         type=float,
         default=DEFAULT_STALE_WARNING_S,
-        help="seconds; default 0.050",
     )
     p.add_argument(
         "--imu-timeout",
         type=float,
         default=DEFAULT_IMU_TIMEOUT_S,
-        help="seconds; default 0.150",
     )
     p.add_argument(
         "--teensy-timeout",
@@ -1265,54 +1375,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     p.add_argument(
-        "--zero-samples",
-        type=int,
-        default=200,
-    )
-    p.add_argument(
-        "--zero-timeout",
+        "--zero-settle",
         type=float,
-        default=10.0,
+        default=3.0,
+        help=(
+            "Seconds to let the IMU attitude solution settle before zero "
+            "calibration (default: 3.0)"
+        ),
     )
-    p.add_argument(
-        "--skip-zero",
-        action="store_true",
-    )
-    p.add_argument(
-        "--no-configure-imu",
-        action="store_true",
-    )
+    p.add_argument("--zero-samples", type=int, default=200)
+    p.add_argument("--zero-timeout", type=float, default=10.0)
+    p.add_argument("--skip-zero", action="store_true")
+    p.add_argument("--no-configure-imu", action="store_true")
 
-    p.add_argument(
-        "--rescaling",
-        type=float,
-        default=5.0,
-    )
-    p.add_argument(
-        "--flex",
-        type=float,
-        default=1.0,
-    )
-    p.add_argument(
-        "--ext",
-        type=float,
-        default=1.0,
-    )
-    p.add_argument(
-        "--delay-index",
-        type=int,
-        default=0,
-    )
-    p.add_argument(
-        "--filter-tau",
-        type=float,
-        default=0.025,
-    )
-    p.add_argument(
-        "--max-command",
-        type=float,
-        default=5.0,
-    )
     p.add_argument(
         "--left-angle-sign",
         type=float,
@@ -1327,19 +1402,30 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     p.add_argument(
-        "--enable",
-        action="store_true",
-        help=(
-            "actually allow torque output; "
-            "default is safe calculation/logging only"
-        ),
+        "--policy",
+        choices=("direct", "pd"),
+        default="direct",
     )
-
     p.add_argument(
-        "--csv",
+        "--model",
         type=Path,
         default=None,
     )
+
+    # Current Teensy rejects inputs beyond +/-5 Nm, so PC default is matched.
+    p.add_argument(
+        "--max-torque",
+        type=float,
+        default=5.0,
+        help="PC NN torque clamp in Nm; current Teensy input limit is +/-5 Nm",
+    )
+    p.add_argument(
+        "--arm",
+        action="store_true",
+        help="Allow valid NN torque to be sent. Default is dry-run zero torque.",
+    )
+
+    p.add_argument("--csv", type=Path, default=None)
 
     return p
 
@@ -1350,14 +1436,16 @@ def validate_args(a: argparse.Namespace) -> None:
         a.right_port.upper(),
         a.teensy_port.upper(),
     }
-
     if len(ports) != 3:
         raise ValueError(
             "left IMU, right IMU, and Teensy must use different COM ports"
         )
 
-    if a.rate <= 0:
-        raise ValueError("--rate must be positive")
+    if abs(a.rate - 100.0) > 1.0e-6:
+        raise ValueError(
+            "The packaged neural policies require --rate 100."
+        )
+
     if a.print_rate <= 0:
         raise ValueError("--print-rate must be positive")
     if a.plot_rate <= 0:
@@ -1374,22 +1462,22 @@ def validate_args(a: argparse.Namespace) -> None:
     if a.teensy_timeout <= 0:
         raise ValueError("--teensy-timeout must be positive")
 
+    if a.zero_settle < 0:
+        raise ValueError("--zero-settle must be >= 0")
     if a.zero_samples <= 0:
         raise ValueError("--zero-samples must be positive")
     if a.zero_timeout <= 0:
         raise ValueError("--zero-timeout must be positive")
 
-    if a.delay_index < 0 or a.delay_index >= 100:
-        raise ValueError("--delay-index must be in [0, 99]")
-    if a.filter_tau <= 0:
-        raise ValueError("--filter-tau must be positive")
-    if a.max_command <= 0:
-        raise ValueError("--max-command must be positive")
+    if a.max_torque <= 0 or a.max_torque > 5.0:
+        raise ValueError(
+            "--max-torque must be in (0, 5] to match the current Teensy."
+        )
 
 
 def default_csv_path() -> Path:
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return Path("logs") / f"samsung_formal_record_{stamp}.csv"
+    return Path("logs") / f"pc_nn_formal_{stamp}.csv"
 
 
 # =============================================================================
@@ -1409,6 +1497,22 @@ def main() -> None:
                 "Install with: python -m pip install matplotlib"
             ) from exc
 
+    torch.set_num_threads(1)
+
+    policy = NeuralTorqueInterface(
+        a.policy,
+        a.model.expanduser().resolve() if a.model is not None else None,
+    )
+
+    if policy.available:
+        zero_test = policy.zero_state_test()
+        if zero_test is not None:
+            print(
+                "[NN ZERO TEST] exact zero state -> "
+                f"L={zero_test[0]:+.4f} Nm, "
+                f"R={zero_test[1]:+.4f} Nm"
+            )
+
     csv_path = (
         a.csv.expanduser().resolve()
         if a.csv is not None
@@ -1425,7 +1529,6 @@ def main() -> None:
         configure=not a.no_configure_imu,
         stop_event=stop_event,
     )
-
     right_imu = SingleImuReader(
         name="RIGHT",
         port=a.right_port,
@@ -1433,108 +1536,69 @@ def main() -> None:
         configure=not a.no_configure_imu,
         stop_event=stop_event,
     )
-
     teensy = TeensyLink(
         port=a.teensy_port,
         baud=a.baud,
         stop_event=stop_event,
     )
 
-    controller = SamsungController(
-        SamsungConfig(
-            rescaling=a.rescaling,
-            flex_gain=a.flex,
-            ext_gain=a.ext,
-            delay_index=a.delay_index,
-            filter_tau_s=a.filter_tau,
-            max_command_nm=a.max_command,
-        )
-    )
-
-    plot_queue = None
-    plot_close_event = None
-    plot_process = None
+    plotter = None
 
     if a.display == "plot":
-        ctx = mp.get_context("spawn")
-        plot_queue = ctx.Queue(maxsize=400)
-        plot_close_event = ctx.Event()
-
-        plot_process = ctx.Process(
-            target=plot_worker,
-            args=(plot_queue, plot_close_event),
-            kwargs={
-                "refresh_hz": a.plot_rate,
-                "window_s": a.plot_window,
-                "stale_warning_s": a.stale_warning,
-                "imu_timeout_s": a.imu_timeout,
-            },
-            daemon=True,
+        plotter = PlotSubprocess(
+            refresh_hz=a.plot_rate,
+            window_s=a.plot_window,
+            stale_warning_s=a.stale_warning,
+            imu_timeout_s=a.imu_timeout,
+            teensy_timeout_s=a.teensy_timeout,
         )
 
-    print("=" * 104)
-    print("Samsung PC / dual independent IMU / Teensy controller")
+    print("=" * 108)
+    print("PC NN / dual independent IMU / simplified Teensy controller")
+    print(f"LEFT IMU  : {a.left_port} @ {a.baud} | independent thread")
+    print(f"RIGHT IMU : {a.right_port} @ {a.baud} | independent thread")
+    print(f"Teensy    : {a.teensy_port} @ {a.baud} | independent thread")
+    print("NN/control/TX/CSV : 100.0 Hz")
     print(
-        f"LEFT IMU  : {a.left_port} @ {a.baud} "
-        f"(independent thread)"
-    )
-    print(
-        f"RIGHT IMU : {a.right_port} @ {a.baud} "
-        f"(independent thread)"
-    )
-    print(
-        f"Teensy    : {a.teensy_port} @ {a.baud} "
-        f"(independent thread)"
-    )
-    print(f"Control   : {a.rate:.1f} Hz | CSV target={a.rate:.1f} Hz")
-
-    if a.display == "print":
-        print(f"Display   : PRINT @ {a.print_rate:.1f} Hz")
-    else:
-        print(
-            f"Display   : PLOT @ {a.plot_rate:.1f} Hz redraw | "
-            f"{a.plot_window:.1f}s window"
-        )
-
-    print(
-        f"IMU age   : OK <= {a.stale_warning * 1000:.0f} ms | "
-        f"STALE <= {a.imu_timeout * 1000:.0f} ms | "
-        f"TIMEOUT > {a.imu_timeout * 1000:.0f} ms"
-    )
-    print(
-        f"Samsung   : rescaling={a.rescaling:.3f}, "
-        f"flex={a.flex:.2f}, ext={a.ext:.2f}, "
-        f"delay={a.delay_index}, filter tau={a.filter_tau:.3f}s"
-    )
-    print(f"PC clamp  : ±{a.max_command:.3f} Nm")
-    print(
-        f"Angle coord: Euler-X, standing=0 deg | "
-        f"L sign={a.left_angle_sign:+.0f}, "
-        f"R sign={a.right_angle_sign:+.0f} | "
-        f"CSV/plot/Samsung all use the same relative angle"
-    )
-    print(
-        f"Output    : "
-        f"{'ENABLED' if a.enable else 'DISABLED - calculate/log only'}"
-    )
-    print(
-        "Zero      : "
+        f"Display   : {a.display.upper()} | "
         + (
-            "SKIPPED"
-            if a.skip_zero
-            else f"{a.zero_samples} fresh samples per side"
+            f"{a.print_rate:.1f} Hz"
+            if a.display == "print"
+            else f"{a.plot_rate:.1f} Hz redraw, {a.plot_window:.1f}s window"
         )
     )
+    print(
+        f"IMU age   : OK <= {a.stale_warning*1000:.0f} ms | "
+        f"STALE <= {a.imu_timeout*1000:.0f} ms | "
+        f"TIMEOUT > {a.imu_timeout*1000:.0f} ms"
+    )
+    print(
+        f"Teensy FB : timeout > {a.teensy_timeout*1000:.0f} ms"
+    )
+    print(
+        f"X signs   : L={a.left_angle_sign:+.0f}, "
+        f"R={a.right_angle_sign:+.0f}"
+    )
+    print(
+        "NN units  : angle rad, angular velocity rad/s; "
+        "CSV/plot remain deg and deg/s"
+    )
+    print(
+        f"Policy    : {a.policy} | "
+        f"{'READY' if policy.available else 'MISSING'}"
+    )
+    print(policy.load_message)
+    print(f"PC clamp  : +/-{a.max_torque:.3f} Nm")
+    print(f"Output    : {'ARMED' if a.arm else 'DRY RUN - zero torque sent'}")
     print(f"CSV       : {csv_path}")
     print("Ctrl+C or closing plot -> zero torque + STOP x3")
-    print("=" * 104)
+    print("=" * 108)
 
-    # Start all communication threads.
     left_imu.start()
     right_imu.start()
     teensy.start()
 
-    # Wait for one valid sample from each IMU.
+    # Wait until all three data sources have at least one sample.
     startup_deadline = time.perf_counter() + 7.0
 
     while (
@@ -1543,25 +1607,71 @@ def main() -> None:
     ):
         left_sample, _ = left_imu.snapshot()
         right_sample, _ = right_imu.snapshot()
+        feedback, _ = teensy.snapshot()
 
-        if left_sample is not None and right_sample is not None:
+        if (
+            left_sample is not None
+            and right_sample is not None
+            and feedback is not None
+        ):
             break
 
         time.sleep(0.01)
 
     left_sample, _ = left_imu.snapshot()
     right_sample, _ = right_imu.snapshot()
+    feedback, _ = teensy.snapshot()
 
-    if left_sample is None or right_sample is None:
+    if (
+        left_sample is None
+        or right_sample is None
+        or feedback is None
+    ):
         stop_event.set()
         raise RuntimeError(
-            "Failed to receive both IMUs. "
-            f"LEFT={left_imu.error or 'no sample'}, "
-            f"RIGHT={right_imu.error or 'no sample'}"
+            "Startup data missing. "
+            f"LEFT={left_imu.error or ('OK' if left_sample else 'no sample')}, "
+            f"RIGHT={right_imu.error or ('OK' if right_sample else 'no sample')}, "
+            f"Teensy={teensy.error or ('OK' if feedback else 'no feedback')}"
         )
 
     left_zero = ImuZeroOffset(0.0, 0.0)
     right_zero = ImuZeroOffset(0.0, 0.0)
+
+    if not a.skip_zero and a.zero_settle > 0:
+        print(
+            f"[ZERO SETTLE] Keep still for {a.zero_settle:.1f} s "
+            "while IMU attitude settles..."
+        )
+        settle_end = time.perf_counter() + a.zero_settle
+        next_settle_print = 0.0
+
+        while (
+            time.perf_counter() < settle_end
+            and not stop_event.is_set()
+        ):
+            now_settle = time.perf_counter()
+
+            if now_settle >= next_settle_print:
+                ls, _ = left_imu.snapshot()
+                rs, _ = right_imu.snapshot()
+
+                if ls is not None and rs is not None:
+                    remaining = max(settle_end - now_settle, 0.0)
+                    print(
+                        f"\r[ZERO SETTLE] "
+                        f"L raw X={ls.angle_x_deg:+8.3f} deg | "
+                        f"R raw X={rs.angle_x_deg:+8.3f} deg | "
+                        f"{remaining:4.1f}s remaining",
+                        end="",
+                        flush=True,
+                    )
+
+                next_settle_print = now_settle + 0.1
+
+            time.sleep(0.002)
+
+        print()
 
     if a.skip_zero:
         print("[ZERO] skipped; angle offsets and gyro biases = 0")
@@ -1574,9 +1684,8 @@ def main() -> None:
             stop_event=stop_event,
         )
 
-    # Start GUI only after zero calibration.
-    if plot_process is not None:
-        plot_process.start()
+    if plotter is not None:
+        plotter.start()
 
     period = 1.0 / a.rate
     print_period = 1.0 / a.print_rate
@@ -1585,22 +1694,17 @@ def main() -> None:
     next_tick = start_time
     next_print = start_time
 
-    last_left_seq = -1
-    last_right_seq = -1
-
     rows = 0
-    left_stale_rows = 0
-    right_stale_rows = 0
-    left_timeout_rows = 0
-    right_timeout_rows = 0
-    control_timeout_rows = 0
-
-    max_left_age_s = 0.0
-    max_right_age_s = 0.0
-
     lcmd = 0.0
     rcmd = 0.0
     enabled = False
+
+    prev_control_ok = False
+    last_nn_error_print = ""
+
+    max_left_age_s = 0.0
+    max_right_age_s = 0.0
+    max_teensy_age_s = 0.0
 
     try:
         with csv_path.open(
@@ -1619,14 +1723,14 @@ def main() -> None:
                     "right_angular_velocity_x_dps",
                     "left_actual_torque_nm",
                     "right_actual_torque_nm",
+                    "left_nn_command_nm",
+                    "right_nn_command_nm",
                 ]
             )
 
             while not stop_event.is_set():
-                if (
-                    plot_close_event is not None
-                    and plot_close_event.is_set()
-                ):
+                if plotter is not None and plotter.closed:
+                    print("\nPlot window closed.")
                     break
 
                 now = time.perf_counter()
@@ -1636,8 +1740,6 @@ def main() -> None:
                     right_sample, right_stats = right_imu.snapshot()
                     feedback, teensy_stats = teensy.snapshot()
 
-                    # Samples exist after startup. If a reader thread dies,
-                    # the old sample remains and age reveals the problem.
                     left_age_s = (
                         now - left_sample.host_time
                         if left_sample is not None
@@ -1648,72 +1750,27 @@ def main() -> None:
                         if right_sample is not None
                         else math.inf
                     )
-
-                    max_left_age_s = max(
-                        max_left_age_s,
-                        left_age_s
-                        if math.isfinite(left_age_s)
-                        else 0.0,
-                    )
-                    max_right_age_s = max(
-                        max_right_age_s,
-                        right_age_s
-                        if math.isfinite(right_age_s)
-                        else 0.0,
+                    teensy_age_s = (
+                        now - feedback.host_time
+                        if feedback is not None
+                        else math.inf
                     )
 
-                    left_new = int(
-                        left_sample is not None
-                        and left_sample.sequence != last_left_seq
-                    )
-                    right_new = int(
-                        right_sample is not None
-                        and right_sample.sequence != last_right_seq
-                    )
+                    if math.isfinite(left_age_s):
+                        max_left_age_s = max(max_left_age_s, left_age_s)
+                    if math.isfinite(right_age_s):
+                        max_right_age_s = max(max_right_age_s, right_age_s)
+                    if math.isfinite(teensy_age_s):
+                        max_teensy_age_s = max(
+                            max_teensy_age_s,
+                            teensy_age_s,
+                        )
 
-                    if left_sample is not None:
-                        last_left_seq = left_sample.sequence
+                    left_timeout = left_age_s > a.imu_timeout
+                    right_timeout = right_age_s > a.imu_timeout
+                    teensy_timeout = teensy_age_s > a.teensy_timeout
 
-                    if right_sample is not None:
-                        last_right_seq = right_sample.sequence
-
-                    left_stale = (
-                        left_age_s > a.stale_warning
-                    )
-                    right_stale = (
-                        right_age_s > a.stale_warning
-                    )
-
-                    left_timeout = (
-                        left_age_s > a.imu_timeout
-                    )
-                    right_timeout = (
-                        right_age_s > a.imu_timeout
-                    )
-
-                    if left_stale:
-                        left_stale_rows += 1
-                    if right_stale:
-                        right_stale_rows += 1
-                    if left_timeout:
-                        left_timeout_rows += 1
-                    if right_timeout:
-                        right_timeout_rows += 1
-
-                    imu_control_ok = (
-                        left_sample is not None
-                        and right_sample is not None
-                        and not left_timeout
-                        and not right_timeout
-                    )
-
-                    if not imu_control_ok:
-                        control_timeout_rows += 1
-
-                    # IMPORTANT:
-                    # Display/log angles always use the latest valid sample.
-                    # They are not replaced by NaN on timeout.
-                    left_rel_deg = (
+                    left_angle_deg = (
                         relative_x_deg(
                             left_sample.angle_x_deg,
                             left_zero.angle_x_deg,
@@ -1722,7 +1779,7 @@ def main() -> None:
                         if left_sample is not None
                         else math.nan
                     )
-                    right_rel_deg = (
+                    right_angle_deg = (
                         relative_x_deg(
                             right_sample.angle_x_deg,
                             right_zero.angle_x_deg,
@@ -1732,10 +1789,7 @@ def main() -> None:
                         else math.nan
                     )
 
-                    # Formal recorded angular velocity:
-                    # remove the static startup gyro bias and apply the same
-                    # direction convention used for the corresponding angle.
-                    left_rel_gyro_dps = (
+                    left_gyro_dps = (
                         relative_x_gyro_dps(
                             left_sample.gyro_x_dps,
                             left_zero.gyro_x_dps,
@@ -1744,7 +1798,7 @@ def main() -> None:
                         if left_sample is not None
                         else math.nan
                     )
-                    right_rel_gyro_dps = (
+                    right_gyro_dps = (
                         relative_x_gyro_dps(
                             right_sample.gyro_x_dps,
                             right_zero.gyro_x_dps,
@@ -1752,37 +1806,6 @@ def main() -> None:
                         )
                         if right_sample is not None
                         else math.nan
-                    )
-
-                    # Control keeps using latest valid data through the STALE
-                    # warning region. Only true TIMEOUT forces Samsung to zero.
-                    if imu_control_ok:
-                        lcmd, rcmd = controller.update(
-                            left_rel_deg,
-                            right_rel_deg,
-                            now,
-                        )
-                    else:
-                        lcmd = 0.0
-                        rcmd = 0.0
-
-                    teensy_ok = (
-                        feedback is not None
-                        and now - feedback.host_time
-                        <= a.teensy_timeout
-                    )
-
-                    enabled = bool(
-                        a.enable
-                        and imu_control_ok
-                        and teensy_ok
-                    )
-
-                    # Default no --enable: send zero torque and enable=0.
-                    teensy.send_torque(
-                        lcmd if enabled else 0.0,
-                        rcmd if enabled else 0.0,
-                        enabled,
                     )
 
                     left_actual = (
@@ -1796,29 +1819,134 @@ def main() -> None:
                         else math.nan
                     )
 
+                    imu_inputs_finite = all(
+                        math.isfinite(v)
+                        for v in (
+                            left_angle_deg,
+                            right_angle_deg,
+                            left_gyro_dps,
+                            right_gyro_dps,
+                        )
+                    )
+
+                    imu_ok = (
+                        imu_inputs_finite
+                        and not left_timeout
+                        and not right_timeout
+                    )
+
+                    teensy_ok = (
+                        feedback is not None
+                        and math.isfinite(left_actual)
+                        and math.isfinite(right_actual)
+                        and not teensy_timeout
+                    )
+
+                    # DIRECT policy ignores actual torque internally, so keep
+                    # calculating/recording NN command even if Teensy feedback
+                    # drops out.  PD policy DOES use actual torque, therefore
+                    # fresh Teensy feedback remains mandatory for PD inference.
+                    nn_input_ok = (
+                        imu_ok
+                        and policy.available
+                        and (
+                            a.policy == "direct"
+                            or teensy_ok
+                        )
+                    )
+
+                    nn_valid = False
+
+                    if nn_input_ok:
+                        # For direct policy these first two values are ignored.
+                        # Supplying zero if feedback is stale avoids propagating
+                        # stale motor data into the observation tuple.
+                        obs_left_actual = (
+                            float(left_actual)
+                            if teensy_ok
+                            else 0.0
+                        )
+                        obs_right_actual = (
+                            float(right_actual)
+                            if teensy_ok
+                            else 0.0
+                        )
+
+                        observation: Observation = (
+                            obs_left_actual,
+                            obs_right_actual,
+                            math.radians(left_angle_deg),
+                            math.radians(left_gyro_dps),
+                            math.radians(right_angle_deg),
+                            math.radians(right_gyro_dps),
+                        )
+
+                        neural_output = policy.get_torque(observation)
+
+                        if neural_output is None:
+                            lcmd = 0.0
+                            rcmd = 0.0
+                            policy.reset()
+                        else:
+                            lcmd = max(
+                                -a.max_torque,
+                                min(a.max_torque, neural_output[0]),
+                            )
+                            rcmd = max(
+                                -a.max_torque,
+                                min(a.max_torque, neural_output[1]),
+                            )
+                            nn_valid = True
+                    else:
+                        lcmd = 0.0
+                        rcmd = 0.0
+
+                        if prev_control_ok:
+                            policy.reset()
+
+                    # Keep the existing variable name for plotting/status:
+                    # here it means "NN command is currently valid".
+                    control_ok = nn_valid
+                    prev_control_ok = nn_valid
+
+                    # Safety remains strict: real torque transmission requires
+                    # BOTH a valid NN command and fresh Teensy feedback.
+                    enabled = bool(
+                        a.arm
+                        and nn_valid
+                        and teensy_ok
+                    )
+
+                    teensy.send_torque(
+                        lcmd if enabled else 0.0,
+                        rcmd if enabled else 0.0,
+                        enabled,
+                    )
+
                     elapsed = now - start_time
 
+                    # Strict 100-Hz main-tick logging. Latest samples are used.
                     writer.writerow(
                         [
                             f"{elapsed:.4f}",
                             (
-                                f"{left_rel_deg:.4f}"
-                                if math.isfinite(left_rel_deg)
+                                f"{left_angle_deg:.4f}"
+                                if math.isfinite(left_angle_deg)
                                 else ""
                             ),
                             (
-                                f"{left_rel_gyro_dps:.4f}"
-                                if math.isfinite(left_rel_gyro_dps)
+                                f"{left_gyro_dps:.4f}"
+                                if math.isfinite(left_gyro_dps)
                                 else ""
                             ),
                             (
-                                f"{right_rel_deg:.4f}"
-                                if math.isfinite(right_rel_deg)
+                                f"{right_angle_deg:.4f}"
+                                if math.isfinite(right_angle_deg)
                                 else ""
                             ),
                             (
-                                f"{right_rel_gyro_dps:.4f}"
-                                if math.isfinite(right_rel_gyro_dps)
+                                f"{right_gyro_dps:.4f}"
+                                if math.isfinite(right_gyro_dps)
                                 else ""
                             ),
                             (
@@ -1831,48 +1959,63 @@ def main() -> None:
                                 if math.isfinite(right_actual)
                                 else ""
                             ),
+                            (
+                                f"{lcmd:.4f}"
+                                if math.isfinite(lcmd)
+                                else ""
+                            ),
+                            (
+                                f"{rcmd:.4f}"
+                                if math.isfinite(rcmd)
+                                else ""
+                            ),
                         ]
                     )
                     rows += 1
 
-                    if plot_queue is not None:
-                        push_plot_sample(
-                            plot_queue,
+                    if plotter is not None:
+                        plotter.push(
                             (
                                 elapsed,
-                                left_rel_deg,
-                                right_rel_deg,
+                                left_angle_deg,
+                                right_angle_deg,
                                 lcmd,
                                 rcmd,
                                 left_actual,
                                 right_actual,
                                 left_age_s,
                                 right_age_s,
-                                imu_control_ok,
-                            ),
+                                teensy_age_s,
+                                control_ok,
+                                enabled,
+                            )
                         )
 
                     next_tick += period
 
-                    # Do not perform a long catch-up burst if Windows delayed
-                    # this process. Resume from the current time.
                     if now - next_tick > period:
                         next_tick = now + period
 
-                # Print and plot are mutually exclusive.
                 if a.display == "print" and now >= next_print:
                     left_sample, left_stats = left_imu.snapshot()
                     right_sample, right_stats = right_imu.snapshot()
                     feedback, teensy_stats = teensy.snapshot()
 
+                    now2 = time.perf_counter()
+
                     left_age = (
-                        time.perf_counter() - left_sample.host_time
+                        now2 - left_sample.host_time
                         if left_sample is not None
                         else math.inf
                     )
                     right_age = (
-                        time.perf_counter() - right_sample.host_time
+                        now2 - right_sample.host_time
                         if right_sample is not None
+                        else math.inf
+                    )
+                    teensy_age = (
+                        now2 - feedback.host_time
+                        if feedback is not None
                         else math.inf
                     )
 
@@ -1887,72 +2030,38 @@ def main() -> None:
                         a.imu_timeout,
                     )
 
-                    left_angle = (
-                        relative_x_deg(
-                            left_sample.angle_x_deg,
-                            left_zero.angle_x_deg,
-                            a.left_angle_sign,
-                        )
-                        if left_sample is not None
-                        else math.nan
-                    )
-                    right_angle = (
-                        relative_x_deg(
-                            right_sample.angle_x_deg,
-                            right_zero.angle_x_deg,
-                            a.right_angle_sign,
-                        )
-                        if right_sample is not None
-                        else math.nan
-                    )
-                    left_gyro = (
-                        relative_x_gyro_dps(
-                            left_sample.gyro_x_dps,
-                            left_zero.gyro_x_dps,
-                            a.left_angle_sign,
-                        )
-                        if left_sample is not None
-                        else math.nan
-                    )
-                    right_gyro = (
-                        relative_x_gyro_dps(
-                            right_sample.gyro_x_dps,
-                            right_zero.gyro_x_dps,
-                            a.right_angle_sign,
-                        )
-                        if right_sample is not None
-                        else math.nan
-                    )
-
-                    phase_deg = (
-                        right_angle - left_angle
-                        if math.isfinite(left_angle)
-                        and math.isfinite(right_angle)
-                        else math.nan
-                    )
-
                     actual_text = (
-                        f"{feedback.left_actual_nm:+.3f}/"
-                        f"{feedback.right_actual_nm:+.3f}"
+                        f"{feedback.left_actual_nm:+.4f}/"
+                        f"{feedback.right_actual_nm:+.4f}"
                         if feedback is not None
                         else "NO_FB"
+                    )
+                    teensy_state = (
+                        "OK"
+                        if teensy_age <= a.teensy_timeout
+                        else "TIMEOUT"
                     )
 
                     print(
                         f"L {left_stats.hz:5.1f}Hz "
-                        f"X={left_angle:+7.2f}deg "
-                        f"W={left_gyro:+7.2f}dps "
-                        f"age={left_age * 1000:6.1f}ms [{lstate}] | "
+                        f"age={left_age*1000:6.1f}ms [{lstate}] | "
                         f"R {right_stats.hz:5.1f}Hz "
-                        f"X={right_angle:+7.2f}deg "
-                        f"W={right_gyro:+7.2f}dps "
-                        f"age={right_age * 1000:6.1f}ms [{rstate}] | "
-                        f"PH={phase_deg:+7.2f}deg | "
-                        f"CMD={lcmd:+.3f}/{rcmd:+.3f} | "
+                        f"age={right_age*1000:6.1f}ms [{rstate}] | "
+                        f"T {teensy_stats.hz:5.1f}Hz "
+                        f"age={teensy_age*1000:6.1f}ms "
+                        f"[{teensy_state}] | "
+                        f"CMD={lcmd:+.4f}/{rcmd:+.4f} | "
                         f"ACT={actual_text} | "
-                        f"T={teensy_stats.hz:5.1f}Hz | "
+                        f"NN={'OK' if control_ok else 'ZERO'} | "
                         f"{'ON' if enabled else 'OFF'}"
                     )
+
+                    if (
+                        policy.last_error
+                        and policy.last_error != last_nn_error_print
+                    ):
+                        print("[NN ERROR]", policy.last_error)
+                        last_nn_error_print = policy.last_error
 
                     next_print = now + print_period
 
@@ -1965,7 +2074,6 @@ def main() -> None:
         print("\nCtrl+C received.")
 
     finally:
-        # Always command a safe stop first.
         try:
             for _ in range(3):
                 teensy.send_torque(0.0, 0.0, False)
@@ -1976,41 +2084,25 @@ def main() -> None:
 
         stop_event.set()
 
-        if plot_queue is not None:
-            try:
-                plot_queue.put_nowait(None)
-            except Exception:
-                pass
-
-        if plot_close_event is not None:
-            plot_close_event.set()
+        if plotter is not None:
+            plotter.stop()
 
         left_imu.join(timeout=2.0)
         right_imu.join(timeout=2.0)
         teensy.join(timeout=2.0)
 
-        if plot_process is not None:
-            plot_process.join(timeout=2.0)
-
-            if plot_process.is_alive():
-                plot_process.terminate()
-                plot_process.join(timeout=1.0)
-
         _, left_stats = left_imu.snapshot()
         _, right_stats = right_imu.snapshot()
         _, teensy_stats = teensy.snapshot()
 
-        duration = max(
-            time.perf_counter() - start_time,
-            1e-9,
-        )
+        duration = max(time.perf_counter() - start_time, 1e-9)
         csv_hz = rows / duration
 
-        print("=" * 104)
+        print("=" * 108)
         print(f"CSV saved     : {csv_path}")
         print(
             f"CSV rows/rate : {rows} / {csv_hz:.2f} Hz "
-            f"(target {a.rate:.1f} Hz)"
+            f"(target 100.0 Hz)"
         )
         print(
             "Zero angle    : "
@@ -2024,50 +2116,35 @@ def main() -> None:
         )
         print(
             f"IMU final Hz  : "
-            f"L={left_stats.hz:.1f}, "
-            f"R={right_stats.hz:.1f}"
-        )
-        print(
-            f"IMU bad       : "
-            f"L={left_stats.bad_packets}, "
-            f"R={right_stats.bad_packets}"
-        )
-        print(
-            f"Max sample age: "
-            f"L={max_left_age_s * 1000:.1f} ms, "
-            f"R={max_right_age_s * 1000:.1f} ms"
-        )
-        print(
-            f"Stale rows    : "
-            f"L={left_stale_rows}, "
-            f"R={right_stale_rows} "
-            f"(>{a.stale_warning * 1000:.0f} ms)"
-        )
-        print(
-            f"Timeout rows  : "
-            f"L={left_timeout_rows}, "
-            f"R={right_timeout_rows}, "
-            f"control={control_timeout_rows} "
-            f"(>{a.imu_timeout * 1000:.0f} ms)"
+            f"L={left_stats.hz:.1f}, R={right_stats.hz:.1f}"
         )
         print(
             f"Teensy final  : "
             f"{teensy_stats.hz:.1f} Hz, "
             f"crc_errors={teensy_stats.crc_errors}"
         )
+        print(
+            "Max data age  : "
+            f"L={max_left_age_s*1000:.1f} ms, "
+            f"R={max_right_age_s*1000:.1f} ms, "
+            f"T={max_teensy_age_s*1000:.1f} ms"
+        )
+        print(
+            f"NN inference  : calls={policy.calls}, "
+            f"valid={policy.valid_outputs}"
+        )
 
         if left_imu.error:
             print("LEFT IMU error :", left_imu.error)
-
         if right_imu.error:
             print("RIGHT IMU error:", right_imu.error)
-
         if teensy.error:
             print("Teensy error   :", teensy.error)
+        if policy.last_error:
+            print("NN last error  :", policy.last_error)
 
-        print("=" * 104)
+        print("=" * 108)
 
 
 if __name__ == "__main__":
-    mp.freeze_support()
     main()

@@ -11,16 +11,6 @@
  *   6) Apply command timeout, torque/current limit, slew-rate limit,
  *      velocity safety, motor-feedback safety and drive-fault safety.
  *
- * Removed from the old version:
- *   - All IM948 initialization / parsing / timeout logic.
- *   - IMU fields in telemetry.
- *   - Position-limit code (it was disabled).
- *   - 10-byte STATUS telemetry.
- *   - UART TX ring buffer (14 bytes @ 100 Hz is far below 115200 baud).
- *   - First-order torque LPF. Slew limiting is retained and adds much less lag.
- *   - Persistent software fault-latch/status-bit machinery.
- *   - Motor software-zero procedure (position is no longer used here).
- *
  * UART protocol
  * =============
  *
