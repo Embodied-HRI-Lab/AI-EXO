@@ -95,12 +95,12 @@ from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Final, Optional
+from typing import Final, Optional, Tuple
 
 import numpy as np
 import serial
-import torch
-from torch import nn
+import torch  
+from torch import nn   
 
 # =============================================================================
 # General configuration
@@ -277,10 +277,10 @@ def configure_imu(uart: serial.Serial) -> None:
             REPORT_TAG & 0xFF,
             (REPORT_TAG >> 8) & 0xFF,
         ]
-    )
+    )    
 
-    imu_send(uart, params, 0.30)
-    imu_send(uart, bytes([CMD_REPORT_ON]), 0.20)
+    imu_send(uart, params, 0.30)  
+    imu_send(uart, bytes([CMD_REPORT_ON]), 0.20)   
 
 
 def parse_imu_body(
@@ -856,8 +856,8 @@ def calibrate_initial_x_zero(
 
 
 
-Observation = tuple[float, float, float, float, float, float]
-TorqueCommand = tuple[float, float]
+Observation = Tuple[float, float, float, float, float, float]
+TorqueCommand = Tuple[float, float]   
 
 # ============================================================
 # 6. Neural-network policy
@@ -883,7 +883,7 @@ class PolicyMLP(nn.Module):
         )
 
     def forward(self, value: torch.Tensor) -> torch.Tensor:
-        return self.network(value)
+        return self.network(value)  
 
 
 class NeuralTorqueInterface:
@@ -1012,7 +1012,7 @@ class NeuralTorqueInterface:
         hip4 = np.asarray(
             [right_angle, left_angle, right_velocity, left_velocity],
             dtype=np.float32,
-        )
+        )  
 
         if self.policy_type == "direct":
             history = self._append_history(hip4)
@@ -1020,10 +1020,10 @@ class NeuralTorqueInterface:
             normalized = torch.from_numpy(
                 (features - self.input_mean) / self.input_std
             )[None]
-            with torch.inference_mode():
+            with torch.inference_mode(): 
                 desired_nm = (
                     self.torque_scale_nm * self.model(normalized)[0].numpy()
-                )
+                )  
             return self._limit(desired_nm)
 
         actual_normalized = np.asarray(
@@ -1068,8 +1068,8 @@ class NeuralTorqueInterface:
         except Exception as exc:
             self.last_error = (
                 f"{type(exc).__name__}: {exc}"
-            )
-            return None
+            )   
+            return None 
 
         if result is None:
             self.last_error = ""
@@ -1081,8 +1081,8 @@ class NeuralTorqueInterface:
                     "Output must contain exactly two torque values."
                 )
 
-            left = float(result[0])
-            right = float(result[1])
+            left = float(result[0])  
+            right = float(result[1])  
 
             if not math.isfinite(left) or not math.isfinite(right):
                 raise ValueError("Output contains NaN or Inf.")
@@ -1502,7 +1502,7 @@ def main() -> None:
     policy = NeuralTorqueInterface(
         a.policy,
         a.model.expanduser().resolve() if a.model is not None else None,
-    )
+    )  
 
     if policy.available:
         zero_test = policy.zero_state_test()
@@ -2143,8 +2143,8 @@ def main() -> None:
         if policy.last_error:
             print("NN last error  :", policy.last_error)
 
-        print("=" * 108)
+        print("=" * 108)  
 
 
 if __name__ == "__main__":
-    main()
+    main()   

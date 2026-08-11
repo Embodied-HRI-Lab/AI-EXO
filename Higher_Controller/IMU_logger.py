@@ -87,15 +87,15 @@ DEFAULT_PLOT_HZ = 30.0
 DEFAULT_PLOT_WINDOW_S = 10.0
 
 DEFAULT_ZERO_SAMPLES = 200
-DEFAULT_ZERO_TIMEOUT_S = 10.0
-DEFAULT_IMU_TIMEOUT_S = 0.150
-DEFAULT_FLUSH_INTERVAL_S = 1.0
+DEFAULT_ZERO_TIMEOUT_S = 10.0 
+DEFAULT_IMU_TIMEOUT_S = 0.150 
+DEFAULT_FLUSH_INTERVAL_S = 1.0 
 
 # Direction convention.
 # Keep both +1.0 if you want the IMU's native X-axis signs.
 # If one sensor is mounted in the opposite direction, change that side to -1.0.
-LEFT_DIRECTION = -1.0
-RIGHT_DIRECTION = -1.0
+LEFT_DIRECTION = -1.0 
+RIGHT_DIRECTION = -1.0 
 
 
 # =============================================================================

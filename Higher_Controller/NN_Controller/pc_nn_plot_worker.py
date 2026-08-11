@@ -2,9 +2,10 @@
 Standalone realtime plot worker for pc_nn_formal_controller_plotfix.py.
 
 IMPORTANT:
-    This file deliberately does NOT import torch and does NOT import the
-    controller module. On Windows this prevents the plot process from
-    reinitializing PyTorch's Intel OpenMP runtime (OMP Error #15).
+    Realtime stdin mode does NOT import torch or the controller module. On
+    Windows this prevents the plot process from reinitializing PyTorch's Intel
+    OpenMP runtime (OMP Error #15). Offline ``--csv`` mode explicitly loads the
+    controller policy because it performs neural-network inference itself.
 
 Input:
     tab-separated samples on stdin:
@@ -20,17 +21,139 @@ Input:
         teensy_age_s
         control_ok
         enabled
+
+Offline example:
+    python pc_nn_plot_worker.py --csv ../logs/hjc07.csv --policy direct --show
 """
 
 from __future__ import annotations
 
 import argparse
+import csv
 import math
 import queue
 import sys
 import threading
 import time
 from collections import deque
+from pathlib import Path
+
+
+
+def run_offline_nn_plot(
+    csv_path: Path,
+    policy_type: str,
+    model_path: Path | None,
+    output_path: Path | None,
+    show: bool,
+) -> None:
+    """Build controller states from a CSV, infer NN torque, and plot it."""
+    # Keep torch/controller imports out of the realtime stdin worker mode.
+    from NN_PC_Controller import NeuralTorqueInterface   
+    import matplotlib.pyplot as plt   
+
+    required = (
+        "elapsed_s",
+        "left_angle_x_deg",
+        "left_angular_velocity_x_dps",
+        "right_angle_x_deg",
+        "right_angular_velocity_x_dps",
+        "left_actual_torque_nm",
+        "right_actual_torque_nm",
+    )
+    time_values: list[float] = []
+    left_angles: list[float] = []   
+    right_angles: list[float] = []  
+    left_actual_values: list[float] = []  
+    right_actual_values: list[float] = []  
+    left_nn_values: list[float] = []  
+    right_nn_values: list[float] = []    
+
+    policy = NeuralTorqueInterface(policy_type, model_path)
+    if not policy.available:
+        raise RuntimeError(policy.load_message)
+    print(policy.load_message)
+    policy.reset()   
+
+    with csv_path.open("r", newline="", encoding="utf-8-sig") as csv_file:
+        reader = csv.DictReader(csv_file)
+        missing = [name for name in required if name not in (reader.fieldnames or [])]
+        if missing:
+            raise ValueError(f"Missing CSV columns: {', '.join(missing)}")
+
+        for row_number, row in enumerate(reader, start=2):
+            try:
+                elapsed = float(row["elapsed_s"])
+                left_angle_deg = float(row["left_angle_x_deg"])
+                left_velocity_dps = float(row["left_angular_velocity_x_dps"])
+                right_angle_deg = float(row["right_angle_x_deg"])
+                right_velocity_dps = float(row["right_angular_velocity_x_dps"])
+                left_actual = float(row["left_actual_torque_nm"])
+                right_actual = float(row["right_actual_torque_nm"])
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"Invalid numeric data at CSV row {row_number}") from exc
+
+            # Must match Observation in NN_PC_Controller.py exactly:
+            # actual torque [Nm], hip angle [rad], angular velocity [rad/s].
+            state = (
+                left_actual,
+                right_actual,
+                math.radians(left_angle_deg),
+                math.radians(left_velocity_dps),
+                math.radians(right_angle_deg),
+                math.radians(right_velocity_dps),
+            )
+            output_torque = policy.get_torque(state)
+            if output_torque is None: 
+                raise RuntimeError(
+                    f"NN inference failed at CSV row {row_number}: "
+                    f"{policy.last_error or 'unknown error'}"
+                )
+
+            time_values.append(elapsed)  
+            left_angles.append(left_angle_deg)  
+            right_angles.append(right_angle_deg)
+            left_actual_values.append(left_actual)   
+            right_actual_values.append(right_actual)
+            left_nn_values.append(output_torque[0])
+            right_nn_values.append(output_torque[1])  
+
+    if not time_values:
+        raise ValueError(f"No data rows found in {csv_path}")
+
+    fig, (ax_angle, ax_torque) = plt.subplots(2, 1, sharex=True, figsize=(11, 7))
+    ax_angle.plot(time_values, left_angles, label="Left hip angle")
+    ax_angle.plot(time_values, right_angles, label="Right hip angle")
+    ax_angle.set_ylabel("Angle (deg)")
+    ax_angle.legend(loc="upper right")
+    ax_angle.grid(True, alpha=0.25)
+
+    ax_torque.plot(time_values, left_nn_values, label="Left NN output")
+    ax_torque.plot(time_values, right_nn_values, label="Right NN output")
+    ax_torque.plot(time_values, left_actual_values, "--", alpha=0.65,
+                   label="Left actual")
+    ax_torque.plot(time_values, right_actual_values, "--", alpha=0.65,
+                   label="Right actual")
+    ax_torque.set_xlabel("Elapsed time (s)")
+    ax_torque.set_ylabel("Torque (Nm)")
+    ax_torque.legend(loc="upper right", ncols=2)
+    ax_torque.grid(True, alpha=0.25)
+    fig.suptitle(f"{csv_path.stem} - {policy_type} NN inference")
+    fig.tight_layout()
+
+    output_path = output_path or csv_path.with_name(
+        f"{csv_path.stem}_{policy_type}_nn_torque.png"
+    )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_path, dpi=300, bbox_inches="tight")
+    print(
+        f"Plotted {len(time_values)} states; valid NN outputs="
+        f"{policy.valid_outputs}. Saved: {output_path}"
+    )
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
 
 
 def state_text(age_s: float, stale_s: float, timeout_s: float) -> str:
@@ -86,8 +209,22 @@ def stdin_reader(out_queue: queue.Queue, eof_event: threading.Event) -> None:
         eof_event.set()
 
 
-def main() -> None:
+def main() -> None:  
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--csv", type=Path,
+        help="Offline mode: build NN states from this exoskeleton CSV",
+    )
+    parser.add_argument(
+        "--policy", choices=("direct", "pd"), default="direct",
+        help="Neural-network policy used in offline mode (default: direct)",
+    )
+    parser.add_argument(
+        "--model", type=Path,
+        help="Optional .pt model; defaults to the selected controller model",
+    )
+    parser.add_argument("--output", type=Path, help="Offline plot output path")
+    parser.add_argument("--show", action="store_true", help="Show offline plot")
     parser.add_argument("--refresh-hz", type=float, default=30.0)
     parser.add_argument("--window-s", type=float, default=10.0)
     parser.add_argument("--stale-warning-s", type=float, default=0.05)
@@ -95,10 +232,25 @@ def main() -> None:
     parser.add_argument("--teensy-timeout-s", type=float, default=0.20)
     args = parser.parse_args()
 
+    if args.csv is not None:
+        run_offline_nn_plot(
+            csv_path=args.csv.expanduser().resolve(),
+            policy_type=args.policy,
+            model_path=(
+                args.model.expanduser().resolve() if args.model is not None else None
+            ),
+            output_path=(
+                args.output.expanduser().resolve()
+                if args.output is not None else None
+            ),
+            show=args.show,
+        )
+        return
+
     # Matplotlib/Numpy live only in this helper process.
     import matplotlib.pyplot as plt
 
-    history_len = max(int(args.window_s * 100.0 * 1.5), 300)
+    history_len = max(int(args.window_s * 100.0 * 1.5), 300)  
 
     t_hist = deque(maxlen=history_len)
     la_hist = deque(maxlen=history_len)
@@ -139,14 +291,14 @@ def main() -> None:
     line_rcmd, = ax_torque.plot([], [], label="Right NN command")
     line_lact, = ax_torque.plot([], [], label="Left actual")
     line_ract, = ax_torque.plot([], [], label="Right actual")
-    ax_torque.axhline(0.0, linewidth=0.8)
-    ax_torque.set_ylabel("Torque (Nm)")
-    ax_torque.set_xlabel("Elapsed time (s)")
+    ax_torque.axhline(0.0, linewidth=0.8) 
+    ax_torque.set_ylabel("Torque (Nm)") 
+    ax_torque.set_xlabel("Elapsed time (s)") 
     ax_torque.set_title("NN command and motor actual torque")
     ax_torque.legend(loc="upper right")
-    ax_torque.grid(True, alpha=0.25)
+    ax_torque.grid(True, alpha=0.25)  
 
-    status_title = fig.suptitle("Waiting for samples...")
+    status_title = fig.suptitle("Waiting for samples...")  
 
     latest_left_age = math.inf
     latest_right_age = math.inf

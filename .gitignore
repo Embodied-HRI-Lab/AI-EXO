@@ -1,0 +1,9 @@
+# Generated data-analysis figures
+/Data/figures/
+
+# Python cache files
+__pycache__/
+*.py[cod]
+
+# Generated neural-network plots
+*_nn_torque.png
