@@ -78,7 +78,7 @@ def run_offline_nn_plot(
 
     policy = NeuralTorqueInterface(policy_type, model_path)
     if not policy.available:
-        raise RuntimeError(policy.load_message)
+        raise RuntimeError(policy.load_message)  
     print(policy.load_message)
     policy.reset()   
 
