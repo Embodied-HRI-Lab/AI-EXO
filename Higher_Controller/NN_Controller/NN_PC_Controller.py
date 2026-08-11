@@ -155,6 +155,7 @@ CONTROL_AXIS = "X"
 ANGLE_SCALE_DEG = 180.0 / 32768.0
 GYRO_SCALE_DPS = 2000.0 / 32768.0
 MAX_IMU_DATA_LEN = 128
+DEG_TO_RAD       = math.pi / 180.0  
 
 
 @dataclass(frozen=True)
@@ -962,8 +963,8 @@ class NeuralTorqueInterface:
         old_valid_outputs = self.valid_outputs
         old_error = self.last_error
 
-        self.reset()
-        result: Optional[TorqueCommand] = None
+        self.reset()  
+        result: Optional[TorqueCommand] = None   
 
         for _ in range(max(int(steps), self.history_steps, 1)):
             result = self.get_torque((0.0, 0.0, 0.0, 0.0, 0.0, 0.0))
@@ -1009,10 +1010,12 @@ class NeuralTorqueInterface:
             right_angle,
             right_velocity,
         ) = observation
+        
         hip4 = np.asarray(
             [right_angle, left_angle, right_velocity, left_velocity],
             dtype=np.float32,
         )  
+        hip4 *= DEG_TO_RAD 
 
         if self.policy_type == "direct":
             history = self._append_history(hip4)
@@ -1033,8 +1036,8 @@ class NeuralTorqueInterface:
             np.concatenate((hip4, actual_normalized))
         )
         right_features = history.reshape(-1)
-        left_features = history[:, [1, 0, 3, 2, 5, 4]].reshape(-1)
-        features = np.stack((right_features, left_features))
+        left_features = history[:, [1, 0, 3, 2, 5, 4]].reshape(-1)  
+        features = np.stack((right_features, left_features))  
         normalized = torch.from_numpy(
             (features - self.input_mean) / self.input_std
         )

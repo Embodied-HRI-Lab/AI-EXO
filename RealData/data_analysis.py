@@ -216,7 +216,7 @@ def plot_dataset_summary(logs: dict[str, pd.DataFrame]) -> plt.Figure:
     axes[0, -1].legend(frameon=False, fontsize=8, ncols=2,
                        bbox_to_anchor=(1.02, 1), loc="upper left")
     fig.suptitle("Exoskeleton log comparison", fontweight="bold")
-    fig.tight_layout()
+    fig.tight_layout()  
     return fig
 
 

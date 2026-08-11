@@ -46,8 +46,15 @@ def run_offline_nn_plot(
     model_path: Path | None,
     output_path: Path | None,
     show: bool,
+    start_index: int = 0,
+    end_index: int | None = None,
 ) -> None:
-    """Build controller states from a CSV, infer NN torque, and plot it."""
+    """Infer NN torque and plot a selected row interval from a CSV.
+
+    Rows before ``start_index`` are passed through the stateful policy as a
+    warm-up so the first plotted output has the correct observation history.
+    ``end_index`` follows normal Python slicing semantics and is excluded.
+    """
     # Keep torch/controller imports out of the realtime stdin worker mode.
     from NN_PC_Controller import NeuralTorqueInterface   
     import matplotlib.pyplot as plt   
@@ -81,7 +88,10 @@ def run_offline_nn_plot(
         if missing:
             raise ValueError(f"Missing CSV columns: {', '.join(missing)}")
 
-        for row_number, row in enumerate(reader, start=2):
+        for data_index, row in enumerate(reader):
+            if end_index is not None and data_index >= end_index:
+                break
+            row_number = data_index + 2  # Account for the CSV header.
             try:
                 elapsed = float(row["elapsed_s"])
                 left_angle_deg = float(row["left_angle_x_deg"])
@@ -104,29 +114,35 @@ def run_offline_nn_plot(
                 math.radians(right_velocity_dps),
             )
             output_torque = policy.get_torque(state)
-            if output_torque is None: 
+            if output_torque is None:
                 raise RuntimeError(
                     f"NN inference failed at CSV row {row_number}: "
                     f"{policy.last_error or 'unknown error'}"
                 )
 
-            time_values.append(elapsed)  
-            left_angles.append(left_angle_deg)  
-            right_angles.append(right_angle_deg)
+            if data_index < start_index:
+                continue
+
+            time_values.append(elapsed)
+            left_angles.append(left_angle_deg)    
+            right_angles.append(right_angle_deg)    
             left_actual_values.append(left_actual)   
             right_actual_values.append(right_actual)
-            left_nn_values.append(output_torque[0])
+            left_nn_values.append(output_torque[0])  
             right_nn_values.append(output_torque[1])  
 
     if not time_values:
-        raise ValueError(f"No data rows found in {csv_path}")
+        raise ValueError(
+            f"No data rows found in selected interval "
+            f"[{start_index}:{end_index}] of {csv_path}"
+        )
 
     fig, (ax_angle, ax_torque) = plt.subplots(2, 1, sharex=True, figsize=(11, 7))
-    ax_angle.plot(time_values, left_angles, label="Left hip angle")
-    ax_angle.plot(time_values, right_angles, label="Right hip angle")
-    ax_angle.set_ylabel("Angle (deg)")
-    ax_angle.legend(loc="upper right")
-    ax_angle.grid(True, alpha=0.25)
+    ax_angle.plot(time_values, left_angles, label="Left hip angle") 
+    ax_angle.plot(time_values, right_angles, label="Right hip angle")  
+    ax_angle.set_ylabel("Angle (deg)") 
+    ax_angle.legend(loc="upper right") 
+    ax_angle.grid(True, alpha=0.25)  
 
     ax_torque.plot(time_values, left_nn_values, label="Left NN output")
     ax_torque.plot(time_values, right_nn_values, label="Right NN output")
@@ -151,9 +167,9 @@ def run_offline_nn_plot(
         f"{policy.valid_outputs}. Saved: {output_path}"
     )
     if show:
-        plt.show()
+        plt.show() 
     else:
-        plt.close(fig)
+        plt.close(fig)  
 
 
 def state_text(age_s: float, stale_s: float, timeout_s: float) -> str:
@@ -210,8 +226,8 @@ def stdin_reader(out_queue: queue.Queue, eof_event: threading.Event) -> None:
 
 
 def main() -> None:  
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
+    parser = argparse.ArgumentParser()  
+    parser.add_argument(  
         "--csv", type=Path,
         help="Offline mode: build NN states from this exoskeleton CSV",
     )
@@ -225,6 +241,14 @@ def main() -> None:
     )
     parser.add_argument("--output", type=Path, help="Offline plot output path")
     parser.add_argument("--show", action="store_true", help="Show offline plot")
+    parser.add_argument(
+        "--start-index", type=int, default=0,
+        help="Offline mode: first CSV data row to plot (included)",
+    )
+    parser.add_argument(
+        "--end-index", type=int,
+        help="Offline mode: final CSV data-row boundary (excluded)",
+    )
     parser.add_argument("--refresh-hz", type=float, default=30.0)
     parser.add_argument("--window-s", type=float, default=10.0)
     parser.add_argument("--stale-warning-s", type=float, default=0.05)
@@ -233,6 +257,10 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.csv is not None:
+        if args.start_index < 0:
+            parser.error("--start-index must be non-negative")
+        if args.end_index is not None and args.end_index <= args.start_index:
+            parser.error("--end-index must be greater than --start-index")
         run_offline_nn_plot(
             csv_path=args.csv.expanduser().resolve(),
             policy_type=args.policy,
@@ -244,6 +272,8 @@ def main() -> None:
                 if args.output is not None else None
             ),
             show=args.show,
+            start_index=args.start_index,
+            end_index=args.end_index,
         )
         return
 
@@ -414,5 +444,5 @@ def main() -> None:
         pass
 
 
-if __name__ == "__main__":
-    main()
+if __name__ == "__main__":  
+    main()  
