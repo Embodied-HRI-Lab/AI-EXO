@@ -1041,7 +1041,7 @@ def main() -> None:
                 "No valid Teensy state received within 3 seconds. "
                 "Check TX/RX crossing, common GND, baud rate, "
                 "Teensy firmware, and /dev/serial0."
-            )
+            )   
 
         print(
             "First valid state received:\n"
