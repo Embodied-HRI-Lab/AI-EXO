@@ -74,6 +74,16 @@ Safe plot test:
 Real torque test (only after diagnostics are satisfactory):
     python samsung_pc_dual_imu_teensy.py --display plot --enable
 
+Runtime keyboard tuning
+-----------------------
+Up arrow    : rescaling +0.5
+Down arrow  : rescaling -0.5 (minimum 0)
+Left arrow  : delay_index -1 sample
+Right arrow : delay_index +1 sample
+
+At 100 Hz, one delay sample is approximately 10 ms.
+The PC-side Samsung torque clamp defaults to ±8 Nm.
+
 Dependencies
 ------------
     python -m pip install pyserial matplotlib
@@ -96,6 +106,11 @@ from pathlib import Path
 from typing import Final
 
 import serial
+
+try:
+    import msvcrt  # Windows console keyboard input
+except ImportError:
+    msvcrt = None
 
 
 # =============================================================================
@@ -862,7 +877,7 @@ class SamsungConfig:
     ext_gain: float = 1.0
     delay_index: int = 0
     filter_tau_s: float = 0.035
-    max_command_nm: float = 0.20
+    max_command_nm: float = 8.0
 
 
 class SamsungController:
@@ -995,6 +1010,87 @@ class SamsungController:
 
 
 # =============================================================================
+# Runtime keyboard control
+# =============================================================================
+
+RESCALING_STEP = 0.5
+DELAY_STEP = 1
+
+
+def poll_console_arrow_keys() -> list[str]:
+    """Read pending Windows console arrow keys without blocking control."""
+    if msvcrt is None:
+        return []
+
+    keys: list[str] = []
+    key_map = {
+        b"H": "up",
+        b"P": "down",
+        b"K": "left",
+        b"M": "right",
+    }
+
+    while msvcrt.kbhit():
+        first = msvcrt.getch()
+
+        # Windows arrow/function keys arrive as a two-byte sequence.
+        if first in (b"\x00", b"\xe0"):
+            second = msvcrt.getch()
+            key = key_map.get(second)
+            if key is not None:
+                keys.append(key)
+
+    return keys
+
+
+def apply_runtime_key(
+    controller: SamsungController,
+    key: str,
+    control_hz: float,
+) -> str | None:
+    """Apply one arrow-key parameter change and return a status message."""
+    if key == "up":
+        controller.cfg.rescaling += RESCALING_STEP
+    elif key == "down":
+        controller.cfg.rescaling = max(
+            0.0,
+            controller.cfg.rescaling - RESCALING_STEP,
+        )
+    elif key == "left":
+        controller.cfg.delay_index = max(
+            0,
+            controller.cfg.delay_index - DELAY_STEP,
+        )
+    elif key == "right":
+        controller.cfg.delay_index = min(
+            controller.HISTORY_SIZE - 1,
+            controller.cfg.delay_index + DELAY_STEP,
+        )
+    else:
+        return None
+
+    delay_ms = 1000.0 * controller.cfg.delay_index / max(control_hz, 1e-9)
+    return (
+        f"[PARAM] rescaling={controller.cfg.rescaling:.1f} | "
+        f"delay={controller.cfg.delay_index} samples "
+        f"(~{delay_ms:.0f} ms @ {control_hz:.1f} Hz)"
+    )
+
+
+def drain_plot_key_queue(control_queue) -> list[str]:
+    if control_queue is None:
+        return []
+
+    keys: list[str] = []
+    while True:
+        try:
+            keys.append(control_queue.get_nowait())
+        except queue.Empty:
+            break
+    return keys
+
+
+# =============================================================================
 # Plot process
 # =============================================================================
 
@@ -1013,6 +1109,7 @@ def sample_state(
 def plot_worker(
     data_queue,
     close_event,
+    control_queue,
     *,
     refresh_hz: float,
     window_s: float,
@@ -1064,11 +1161,23 @@ def plot_worker(
     latest_left_age = math.inf
     latest_right_age = math.inf
     latest_control_ok = False
+    latest_rescaling = math.nan
+    latest_delay_index = 0
 
     def on_close(_event) -> None:
         close_event.set()
 
+    def on_key(event) -> None:
+        if event.key not in ("up", "down", "left", "right"):
+            return
+
+        try:
+            control_queue.put_nowait(event.key)
+        except queue.Full:
+            pass
+
     fig.canvas.mpl_connect("close_event", on_close)
+    fig.canvas.mpl_connect("key_press_event", on_key)
 
     refresh_period = 1.0 / max(refresh_hz, 1.0)
     next_refresh = time.perf_counter()
@@ -1097,6 +1206,8 @@ def plot_worker(
                 left_age_s,
                 right_age_s,
                 control_ok,
+                rescaling,
+                delay_index,
             ) = item
 
             t_hist.append(elapsed)
@@ -1111,6 +1222,8 @@ def plot_worker(
             latest_left_age = left_age_s
             latest_right_age = right_age_s
             latest_control_ok = control_ok
+            latest_rescaling = rescaling
+            latest_delay_index = delay_index
             got_any = True
 
         now = time.perf_counter()
@@ -1153,7 +1266,8 @@ def plot_worker(
             status_text.set_text(
                 f"L age={latest_left_age * 1000:5.1f} ms [{left_state}]  |  "
                 f"R age={latest_right_age * 1000:5.1f} ms [{right_state}]  |  "
-                f"control={'OK' if latest_control_ok else 'ZERO'}"
+                f"control={'OK' if latest_control_ok else 'ZERO'}  |  "
+                f"rescaling={latest_rescaling:.1f}  delay={latest_delay_index}"
             )
 
             fig.canvas.draw_idle()
@@ -1286,7 +1400,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--rescaling",
         type=float,
-        default=6.0,
+        default=5.0,
     )
     p.add_argument(
         "--flex",
@@ -1311,7 +1425,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--max-command",
         type=float,
-        default=5.0,
+        default=8.0,
     )
     p.add_argument(
         "--left-angle-sign",
@@ -1453,16 +1567,18 @@ def main() -> None:
 
     plot_queue = None
     plot_close_event = None
+    plot_control_queue = None
     plot_process = None
 
     if a.display == "plot":
         ctx = mp.get_context("spawn")
         plot_queue = ctx.Queue(maxsize=400)
         plot_close_event = ctx.Event()
+        plot_control_queue = ctx.Queue(maxsize=32)
 
         plot_process = ctx.Process(
             target=plot_worker,
-            args=(plot_queue, plot_close_event),
+            args=(plot_queue, plot_close_event, plot_control_queue),
             kwargs={
                 "refresh_hz": a.plot_rate,
                 "window_s": a.plot_window,
@@ -1526,6 +1642,11 @@ def main() -> None:
         )
     )
     print(f"CSV       : {csv_path}")
+    print(
+        "Keys      : Up/Down rescaling ±0.5 | "
+        "Left/Right delay ±1 sample "
+        f"(~{1000.0 / a.rate:.1f} ms/sample)"
+    )
     print("Ctrl+C or closing plot -> zero torque + STOP x3")
     print("=" * 104)
 
@@ -1628,6 +1749,22 @@ def main() -> None:
                     and plot_close_event.is_set()
                 ):
                     break
+
+                # Runtime tuning. Console arrows work on Windows; when the
+                # plot window has focus, matplotlib forwards the same keys.
+                runtime_keys = poll_console_arrow_keys()
+                runtime_keys.extend(
+                    drain_plot_key_queue(plot_control_queue)
+                )
+
+                for key in runtime_keys:
+                    param_message = apply_runtime_key(
+                        controller,
+                        key,
+                        a.rate,
+                    )
+                    if param_message is not None:
+                        print(param_message)
 
                 now = time.perf_counter()
 
@@ -1849,6 +1986,8 @@ def main() -> None:
                                 left_age_s,
                                 right_age_s,
                                 imu_control_ok,
+                                controller.cfg.rescaling,
+                                controller.cfg.delay_index,
                             ),
                         )
 
@@ -1951,6 +2090,8 @@ def main() -> None:
                         f"CMD={lcmd:+.3f}/{rcmd:+.3f} | "
                         f"ACT={actual_text} | "
                         f"T={teensy_stats.hz:5.1f}Hz | "
+                        f"RSC={controller.cfg.rescaling:.1f} "
+                        f"DLY={controller.cfg.delay_index:02d} | "
                         f"{'ON' if enabled else 'OFF'}"
                     )
 
