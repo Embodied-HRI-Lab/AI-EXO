@@ -155,9 +155,6 @@ CONTROL_AXIS = "X"
 ANGLE_SCALE_DEG = 180.0 / 32768.0
 GYRO_SCALE_DPS = 2000.0 / 32768.0
 MAX_IMU_DATA_LEN = 128
-DEG_TO_RAD       = math.pi / 180.0  
-
-
 @dataclass(frozen=True)
 class ImuSample:
     angle_x_deg: float
@@ -1014,8 +1011,9 @@ class NeuralTorqueInterface:
         hip4 = np.asarray(
             [right_angle, left_angle, right_velocity, left_velocity],
             dtype=np.float32,
-        )  
-        hip4 *= DEG_TO_RAD 
+        )
+        # observation is already in rad and rad/s. The main loop converts the
+        # zeroed IMU readings with math.radians() before calling get_torque().
 
         if self.policy_type == "direct":
             history = self._append_history(hip4)
