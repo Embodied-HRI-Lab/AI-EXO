@@ -24,6 +24,10 @@ Input:
 
 Offline example:
     python pc_nn_plot_worker.py --csv ../logs/hjc07.csv --policy direct --show
+
+ExpertData example:
+    python pc_nn_plot_worker.py --expert-trial ../../ExpertData/BT02/\
+normal_walk_1_1_0-6_on --policy direct --show
 """
 
 from __future__ import annotations
@@ -172,6 +176,188 @@ def run_offline_nn_plot(
         plt.close(fig)  
 
 
+def run_expertdata_nn_plot(
+    trial_path: Path,
+    policy_type: str,
+    model_path: Path | None,
+    output_path: Path | None,
+    show: bool,
+    start_index: int = 0,
+    end_index: int | None = None,
+    sample_stride: int = 2,
+    left_angle_sign: float = 1.0,
+    right_angle_sign: float = 1.0,
+) -> None:
+    """Build NN states from one ExpertData trial and plot output torque.
+
+    Filtered joint angles, joint velocities, and measured exoskeleton torques
+    are aligned by timestamp. ExpertData is normally 200 Hz, so the default
+    stride of two replays the packaged policy at its required 100 Hz rate.
+    """
+    from NN_PC_Controller import NeuralTorqueInterface   
+    import matplotlib.pyplot as plt  
+    import numpy as np   
+    import pandas as pd   
+ 
+    trial_path = trial_path.expanduser().resolve()
+    trial_dir = trial_path if trial_path.is_dir() else trial_path.parent
+    if not trial_dir.is_dir():
+        raise FileNotFoundError(f"ExpertData trial does not exist: {trial_path}")
+
+    if trial_path.is_file() and trial_path.name.endswith("_angle_filt.csv"):
+        angle_path = trial_path
+    else:
+        angle_files = sorted(trial_dir.glob("*_angle_filt.csv"))
+        if len(angle_files) != 1:
+            raise FileNotFoundError(
+                f"Expected one *_angle_filt.csv in {trial_dir}, "
+                f"found {len(angle_files)}"
+            )
+        angle_path = angle_files[0]
+
+    prefix = angle_path.name[:-len("_angle_filt.csv")]
+    velocity_path = trial_dir / f"{prefix}_velocity.csv"
+    exo_path = trial_dir / f"{prefix}_exo.csv"  
+    for required_path in (velocity_path, exo_path):
+        if not required_path.is_file():
+            raise FileNotFoundError(f"Required ExpertData file missing: {required_path}")
+
+    angle = pd.read_csv(angle_path, encoding="utf-8-sig")   
+    velocity = pd.read_csv(velocity_path, encoding="utf-8-sig")    
+    exo = pd.read_csv(exo_path, encoding="utf-8-sig")     
+    required_columns = {
+        angle_path: ("time", "hip_flexion_l", "hip_flexion_r"),
+        velocity_path: (
+            "time", "hip_flexion_l_velocity", "hip_flexion_r_velocity",
+        ),
+        exo_path: (
+            "time", "hip_angle_l_torque_measured", "hip_angle_r_torque_measured",
+        ),
+    }   
+    for path, columns in required_columns.items():   
+        frame = angle if path == angle_path else velocity if path == velocity_path else exo
+        missing = [column for column in columns if column not in frame.columns]
+        if missing:
+            raise ValueError(f"{path} is missing columns: {', '.join(missing)}")   
+
+    angle = angle.loc[:, list(required_columns[angle_path])].apply(
+        pd.to_numeric, errors="coerce"
+    ).dropna().sort_values("time")
+    velocity = velocity.loc[:, list(required_columns[velocity_path])].apply(
+        pd.to_numeric, errors="coerce"
+    ).dropna().sort_values("time")
+    exo = exo.loc[:, list(required_columns[exo_path])].apply(
+        pd.to_numeric, errors="coerce"
+    ).dropna().sort_values("time")   
+
+    target_time = angle["time"].to_numpy(dtype=float)
+    left_angle = left_angle_sign * angle["hip_flexion_l"].to_numpy(dtype=float)
+    right_angle = right_angle_sign * angle["hip_flexion_r"].to_numpy(dtype=float)
+
+    def align(frame, column):
+        return np.interp(
+            target_time,
+            frame["time"].to_numpy(dtype=float),
+            frame[column].to_numpy(dtype=float),
+        )
+
+    left_velocity = left_angle_sign * align(velocity, "hip_flexion_l_velocity")
+    right_velocity = right_angle_sign * align(velocity, "hip_flexion_r_velocity")
+    left_actual = align(exo, "hip_angle_l_torque_measured")   
+    right_actual = align(exo, "hip_angle_r_torque_measured")   
+
+    policy = NeuralTorqueInterface(policy_type, model_path)
+    if not policy.available:
+        raise RuntimeError(policy.load_message)
+    print(policy.load_message)
+    policy.reset()
+
+    retained = {
+        "time": [], "left_angle": [], "right_angle": [],
+        "left_velocity": [], "right_velocity": [],
+        "left_actual": [], "right_actual": [],
+        "left_nn": [], "right_nn": [],
+    }
+    stop = len(target_time) if end_index is None else min(end_index, len(target_time))
+    for data_index in range(0, stop, sample_stride):
+        observation = (
+            float(left_actual[data_index]),
+            float(right_actual[data_index]),
+            math.radians(float(left_angle[data_index])),
+            math.radians(float(left_velocity[data_index])),
+            math.radians(float(right_angle[data_index])),
+            math.radians(float(right_velocity[data_index])),
+        )
+        output = policy.get_torque(observation)
+        if output is None:
+            raise RuntimeError(
+                f"NN inference failed at ExpertData index {data_index}: "
+                f"{policy.last_error or 'unknown error'}"
+            )
+        if data_index < start_index:
+            continue
+        retained["time"].append(float(target_time[data_index] - target_time[0]))
+        retained["left_angle"].append(float(left_angle[data_index]))
+        retained["right_angle"].append(float(right_angle[data_index]))
+        retained["left_velocity"].append(float(left_velocity[data_index]))
+        retained["right_velocity"].append(float(right_velocity[data_index]))
+        retained["left_actual"].append(float(left_actual[data_index]))
+        retained["right_actual"].append(float(right_actual[data_index]))
+        retained["left_nn"].append(output[0])
+        retained["right_nn"].append(output[1])
+
+    if not retained["time"]:
+        raise ValueError(f"No ExpertData samples in [{start_index}:{end_index}]")
+
+    figure, axes = plt.subplots(3, 1, figsize=(11, 9), sharex=True)
+    axes[0].plot(retained["time"], retained["left_angle"], label="Left")
+    axes[0].plot(retained["time"], retained["right_angle"], label="Right")
+    axes[0].set_ylabel("Hip angle (deg)")
+    axes[1].plot(retained["time"], retained["left_velocity"], label="Left")
+    axes[1].plot(retained["time"], retained["right_velocity"], label="Right")
+    axes[1].set_ylabel("Hip velocity (deg/s)")
+    axes[2].plot(retained["time"], retained["left_nn"], label="Left NN")
+    axes[2].plot(retained["time"], retained["right_nn"], label="Right NN")
+    axes[2].plot(retained["time"], retained["left_actual"], "--", alpha=0.65,
+                 label="Left measured")
+    axes[2].plot(retained["time"], retained["right_actual"], "--", alpha=0.65,
+                 label="Right measured")
+    axes[2].set_ylabel("Torque (Nm)")
+    axes[2].set_xlabel("Elapsed trial time (s)")
+    for axis in axes:
+        axis.grid(True, alpha=0.25)
+        axis.legend(frameon=False, ncols=2, loc="upper right")
+    figure.suptitle(f"{trial_dir.name} — {policy_type} NN torque from ExpertData")
+    figure.tight_layout()
+
+    output_path = output_path or trial_dir / f"{prefix}_{policy_type}_nn_torque.png"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    figure.savefig(output_path, dpi=300, bbox_inches="tight") 
+    torque_csv_path = output_path.with_suffix(".csv")  
+    pd.DataFrame(
+        {
+            "elapsed_s": retained["time"],
+            "left_hip_angle_deg": retained["left_angle"],
+            "left_hip_velocity_dps": retained["left_velocity"],
+            "right_hip_angle_deg": retained["right_angle"],
+            "right_hip_velocity_dps": retained["right_velocity"],
+            "left_measured_torque_nm": retained["left_actual"],
+            "right_measured_torque_nm": retained["right_actual"],
+            "left_nn_torque_nm": retained["left_nn"],
+            "right_nn_torque_nm": retained["right_nn"],
+        }
+    ).to_csv(torque_csv_path, index=False)
+    print(
+        f"ExpertData states={len(retained['time'])}, stride={sample_stride}, "
+        f"valid NN outputs={policy.valid_outputs}. "
+        f"Saved: {output_path} and {torque_csv_path}"
+    )
+    if show:
+        plt.show()
+    else:
+        plt.close(figure)
+
+
 def state_text(age_s: float, stale_s: float, timeout_s: float) -> str:
     if age_s > timeout_s:
         return "TIMEOUT"
@@ -227,9 +413,14 @@ def stdin_reader(out_queue: queue.Queue, eof_event: threading.Event) -> None:
 
 def main() -> None:  
     parser = argparse.ArgumentParser()  
-    parser.add_argument(  
+    offline_source = parser.add_mutually_exclusive_group()
+    offline_source.add_argument(  
         "--csv", type=Path,
         help="Offline mode: build NN states from this exoskeleton CSV",
+    )
+    offline_source.add_argument(
+        "--expert-trial", type=Path,
+        help="Offline mode: infer from an ExpertData trial folder/angle CSV",
     )
     parser.add_argument(
         "--policy", choices=("direct", "pd"), default="direct",
@@ -249,6 +440,18 @@ def main() -> None:
         "--end-index", type=int,
         help="Offline mode: final CSV data-row boundary (excluded)",
     )
+    parser.add_argument(
+        "--expert-stride", type=int, default=2,
+        help="ExpertData source-row stride; 2 converts 200 Hz to 100 Hz",
+    )
+    parser.add_argument(
+        "--left-angle-sign", type=float, choices=(-1.0, 1.0), default=1.0,
+        help="ExpertData left angle/velocity coordinate sign",
+    )
+    parser.add_argument(
+        "--right-angle-sign", type=float, choices=(-1.0, 1.0), default=1.0,
+        help="ExpertData right angle/velocity coordinate sign",
+    )
     parser.add_argument("--refresh-hz", type=float, default=30.0)
     parser.add_argument("--window-s", type=float, default=10.0)
     parser.add_argument("--stale-warning-s", type=float, default=0.05)
@@ -256,11 +459,15 @@ def main() -> None:
     parser.add_argument("--teensy-timeout-s", type=float, default=0.20)
     args = parser.parse_args()
 
-    if args.csv is not None:
+    if args.csv is not None or args.expert_trial is not None:
         if args.start_index < 0:
             parser.error("--start-index must be non-negative")
         if args.end_index is not None and args.end_index <= args.start_index:
             parser.error("--end-index must be greater than --start-index")
+        if args.expert_stride < 1:
+            parser.error("--expert-stride must be at least 1")
+
+    if args.csv is not None:
         run_offline_nn_plot(
             csv_path=args.csv.expanduser().resolve(),
             policy_type=args.policy,
@@ -274,6 +481,26 @@ def main() -> None:
             show=args.show,
             start_index=args.start_index,
             end_index=args.end_index,
+        )
+        return
+
+    if args.expert_trial is not None:
+        run_expertdata_nn_plot(
+            trial_path=args.expert_trial,
+            policy_type=args.policy,
+            model_path=(
+                args.model.expanduser().resolve() if args.model is not None else None
+            ),
+            output_path=(
+                args.output.expanduser().resolve()
+                if args.output is not None else None
+            ),
+            show=args.show,
+            start_index=args.start_index,
+            end_index=args.end_index,
+            sample_stride=args.expert_stride,
+            left_angle_sign=args.left_angle_sign,
+            right_angle_sign=args.right_angle_sign,
         )
         return
 
@@ -445,4 +672,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":  
-    main()  
+    main()   

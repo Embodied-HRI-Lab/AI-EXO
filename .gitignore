@@ -7,3 +7,6 @@ __pycache__/
 
 # Generated neural-network plots
 *_nn_torque.png
+
+# Generated expert gait datasets and figures
+/ExpertData/processed/

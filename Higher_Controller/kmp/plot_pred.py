@@ -1,14 +1,18 @@
-from tkinter import X  
 import numpy as np 
 import matplotlib.pyplot as plt  
 from scipy.io import loadmat   
-from GMRbasedGP.utils.gmr import plot_gmm, Gmr 
+from pathlib import Path
+
+try:
+    from .GMRbasedGP.utils.gmr import plot_gmm, Gmr
+except ImportError:  # Allow running this file directly from the kmp folder.
+    from GMRbasedGP.utils.gmr import plot_gmm, Gmr
 import seaborn as sns   
 
 import numpy as np   
-import matplotlib as mpl
-import matplotlib.pyplot as plt
-import matplotlib.gridspec as gridspec
+import matplotlib as mpl 
+import matplotlib.pyplot as plt 
+import matplotlib.gridspec as gridspec 
 
 # sns.set(palette="muted", color_codes=True, font_scale=1.5)   
 custom_params = {"axes.spines.right": False, "axes.spines.top": False}   
@@ -50,6 +54,133 @@ color_name = ['nr', 'ng', 'nb', 'ny', 'r', 'b', 'db', 'g', 'o', 'y',
 
 X_LIM = [-30.0, 30.0]      
 Y_LIM = [-30.0, 30.0]       
+
+
+def plot_gait_distribution(
+    result, signal_names=None, gait_data=None, font_size=14
+):
+    """Plot GMR and KMP means with one-standard-deviation bands."""
+    if font_size <= 0:
+        raise ValueError("font_size must be positive")
+    gmr_mean = np.asarray(result["gmr_mean"])
+    n_signals = gmr_mean.shape[1]
+    names = signal_names or [f"Signal {index + 1}" for index in range(n_signals)]
+    if len(names) != n_signals:
+        raise ValueError("signal_names length must match the signal dimension")
+
+    figure, axes = plt.subplots(
+        n_signals, 1, figsize=(9, 3.3 * n_signals), sharex=True, squeeze=False
+    )
+    gait_percent = np.asarray(result["gait_percent"])
+    raw_gaits = None if gait_data is None else np.asarray(gait_data, dtype=float)
+    if raw_gaits is not None and raw_gaits.ndim == 2:
+        raw_gaits = raw_gaits[:, :, None]
+
+    for signal_index, axis in enumerate(axes[:, 0]):
+        if raw_gaits is not None:
+            for gait in raw_gaits:
+                axis.plot(
+                    gait_percent, gait[:, signal_index], color="0.75",
+                    linewidth=0.75, alpha=0.45,
+                )
+
+        for prefix, color, label in (
+            ("gmr", "#0072B2", "GMR"),
+            ("kmp", "#D55E00", "KMP"),
+        ):
+            mean = np.asarray(result[f"{prefix}_mean"])[:, signal_index]
+            variance = np.maximum(
+                np.asarray(result[f"{prefix}_variance"])[:, signal_index], 0.0
+            )
+            standard_deviation = np.sqrt(variance)
+            axis.plot(gait_percent, mean, color=color, linewidth=2.4, label=label)
+            axis.fill_between(
+                gait_percent,
+                mean - standard_deviation,
+                mean + standard_deviation,
+                color=color,
+                alpha=0.16,
+            )
+
+        via_indices = np.asarray(result.get("via_indices", []), dtype=int)
+        via_points = np.asarray(result.get("via_points", []), dtype=float)
+        if len(via_indices) > 0:
+            axis.scatter(
+                gait_percent[via_indices],
+                via_points[:, signal_index],
+                color="#7A1FA2",
+                marker="X",
+                s=70,
+                edgecolor="white",
+                linewidth=0.7,
+                zorder=5,
+                label="Stretched GMR via point",
+            )
+
+        axis.set_ylabel(
+            names[signal_index], fontsize=font_size, fontweight="semibold"
+        )
+        axis.grid(axis="y", alpha=0.22, linewidth=0.7)
+        axis.tick_params(labelsize=font_size - 1)
+        axis.spines["top"].set_visible(False)
+        axis.spines["right"].set_visible(False)
+
+    axes[-1, 0].set_xlabel(
+        "Normalized gait cycle (%)", fontsize=font_size, fontweight="semibold"
+    )
+    axes[-1, 0].set_xlim(0.0, 100.0)
+    handles, labels = axes[0, 0].get_legend_handles_labels()
+    # Remove duplicate labels while preserving their visual order.
+    unique = dict(zip(labels, handles))
+    figure.legend(
+        list(unique.values()),
+        list(unique.keys()),
+        loc="upper center",
+        bbox_to_anchor=(0.5, 0.985),
+        ncol=max(len(unique), 1),
+        frameon=False,
+        columnspacing=1.8,
+        handlelength=2.4,
+        fontsize=font_size - 1,
+    )
+    figure.tight_layout(rect=(0.0, 0.0, 1.0, 0.90), h_pad=1.0)
+    return figure
+
+
+def plot_bilateral_hip_mean_variance(
+    result, gait_data=None, save_path=None, show=False, font_size=14
+):
+    """Plot GMR/KMP mean and variance for left and right hip angles."""
+    gmr_mean = np.asarray(result["gmr_mean"])
+    if gmr_mean.ndim != 2 or gmr_mean.shape[1] != 2:
+        raise ValueError(
+            "Bilateral hip result must contain exactly two signals: left, right"
+        )
+
+    figure = plot_gait_distribution(
+        result=result,
+        signal_names=("Left hip angle (deg)", "Right hip angle (deg)"),
+        gait_data=gait_data,
+        font_size=font_size,
+    )
+    figure.suptitle(
+        "Bilateral Hip-Angle Mean and Variance",
+        y=0.995,
+        fontsize=font_size + 3,
+        fontweight="bold",
+    )
+    if figure.legends:
+        figure.legends[0].set_bbox_to_anchor((0.5, 0.955))
+    figure.tight_layout(rect=(0.0, 0.0, 1.0, 0.87), h_pad=1.0)
+
+    if save_path is not None:
+        output = Path(save_path).expanduser()
+        output.parent.mkdir(parents=True, exist_ok=True)
+        figure.savefig(output, dpi=300, bbox_inches="tight")
+        print(f"Saved bilateral hip distribution: {output}")
+    if show:
+        plt.show()
+    return figure
 
 
 def plot_energy_deformation(

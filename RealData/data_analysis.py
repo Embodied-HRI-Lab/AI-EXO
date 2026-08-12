@@ -37,7 +37,7 @@ def segment_and_normalize_gaits(
     min_cycle_samples: int = 60,
     prominence: float | None = None,
     normalized_points: int = 101,
-) -> pd.DataFrame:
+) -> pd.DataFrame: 
     """Segment left/right gait cycles and normalize each cycle to 0--100%.
 
     Consecutive hip-angle extrema define one gait cycle. All numeric signals are
