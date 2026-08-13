@@ -637,8 +637,8 @@ def configure_controller(config: SamsungAssistConfig) -> None:
     This function changes only the high-level policy. The existing UART,
     CRC, packet parser, receiver thread, and run_control_loop remain intact.
     """
-    global _samsung_controller
-    _samsung_controller = SamsungAssistController(config)
+    global _samsung_controller  
+    _samsung_controller = SamsungAssistController(config)   
 
 
 def controller(state: ExoState) -> ControllerReturn:
@@ -650,13 +650,13 @@ def controller(state: ExoState) -> ControllerReturn:
 
     Output:
         left_desired_torque_Nm,
-        right_desired_torque_Nm,
-        enable
+        right_desired_torque_Nm, 
+        enable 
 
     The actual Samsung assistance algorithm is implemented in the small
     helper file samsung_controller.py.
     """
-    return _samsung_controller(state)
+    return _samsung_controller(state) 
 
 
 def controller_debug_text() -> str:
@@ -664,7 +664,7 @@ def controller_debug_text() -> str:
 
 
 # Attach an optional debug method to preserve run_control_loop's generic
-# callable-policy interface.
+# callable-policy interface. 
 controller.debug_text = controller_debug_text  # type: ignore[attr-defined]
 
 

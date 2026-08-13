@@ -165,7 +165,7 @@ CONTROL_AXIS = "X"
 
 ANGLE_SCALE_DEG = 180.0 / 32768.0
 GYRO_SCALE_DPS = 2000.0 / 32768.0
-MAX_IMU_DATA_LEN = 128
+MAX_IMU_DATA_LEN = 128  
 
 
 @dataclass(frozen=True)
@@ -909,15 +909,15 @@ class SamsungController:
         now: float,
     ) -> tuple[float, float]:
         # Inputs are already standing-zeroed, wrapped, and direction-normalized.
-        left = math.radians(left_angle_deg)
-        right = math.radians(right_angle_deg)
+        left = math.radians(left_angle_deg)  
+        right = math.radians(right_angle_deg)  
 
         if self.last_time is None:
             dt = 1.0 / DEFAULT_CONTROL_HZ
         else:
             dt = max(0.001, min(now - self.last_time, 0.05))
 
-        self.last_time = now
+        self.last_time = now  
 
         if self.left_filtered is None:
             self.left_filtered = left
@@ -968,10 +968,10 @@ class SamsungController:
             current_index - delay
         ) % self.HISTORY_SIZE
 
-        delayed_phase = self.phase_history[delayed_index]
-        delayed_shape = self.shape_history[delayed_index]
+        delayed_phase = self.phase_history[delayed_index]   
+        delayed_shape = self.shape_history[delayed_index]   
 
-        phase_limit = math.radians(120.0)
+        phase_limit = math.radians(120.0)  
 
         if 0.0 <= delayed_phase < phase_limit:
             left_tau = (
@@ -1651,9 +1651,9 @@ def main() -> None:
     print("=" * 104)
 
     # Start all communication threads.
-    left_imu.start()
-    right_imu.start()
-    teensy.start()
+    left_imu.start()  
+    right_imu.start()  
+    teensy.start()  
 
     # Wait for one valid sample from each IMU.
     startup_deadline = time.perf_counter() + 7.0

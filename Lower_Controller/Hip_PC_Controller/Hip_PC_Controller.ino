@@ -443,9 +443,9 @@ static float apply_velocity_safety(
     return 0.0f;
 
   if (velocity <= -Config::MAX_ABS_VELOCITY_RAD_S && torque < 0.0f)
-    return 0.0f;
+    return 0.0f; 
 
-  return torque;
+  return torque;  
 }
 
 static void update_control(uint32_t now_us, float dt_s)
@@ -459,7 +459,7 @@ static void update_control(uint32_t now_us, float dt_s)
     rt.command_enabled = false;
     rt.left_torque.requested = 0.0f;
     rt.right_torque.requested = 0.0f;
-  }
+  }  
 
   // Motor feedback/drive problems are treated more conservatively:
   // output is forced to zero immediately.

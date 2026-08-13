@@ -52,8 +52,8 @@ mycolors = {
 color_name = ['nr', 'ng', 'nb', 'ny', 'r', 'b', 'db', 'g', 'o', 'y', 
 	'p', 'pi', 'lb', 'li', 'lr', 'lg', 'dr', 'em', 'br', 'gy', 'vgy', 'm', 'c', 'rr', 'gl']   
 
-X_LIM = [-30.0, 30.0]      
-Y_LIM = [-30.0, 30.0]       
+X_LIM = [-30.0, 30.0]        
+Y_LIM = [-30.0, 30.0]        
 
 
 def plot_gait_distribution(

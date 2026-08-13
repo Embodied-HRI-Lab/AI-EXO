@@ -16,8 +16,8 @@ def load_hip_angle_csv(csv_path, start_index=0, end_index=None):
     ``start_index`` is included and ``end_index`` is excluded. The returned
     ``angles_deg`` array has shape ``(n_samples, 2)`` in left/right order.
     """
-    path = Path(csv_path).expanduser()
-    if not path.is_file():
+    path = Path(csv_path).expanduser()   
+    if not path.is_file():  
         raise FileNotFoundError(f"CSV file does not exist: {path}")
     if start_index < 0:
         raise ValueError("start_index must be non-negative")
@@ -156,9 +156,9 @@ def learn_gait_distribution_gmr_kmp(
     lambda_covariance=0.6,
     via_indices=None,
     via_points=None,
-    via_variances=None,
-    via_variance=1.0e-8,
-    via_scale=None,
+    via_variances=None, 
+    via_variance=1.0e-8,  
+    via_scale=None, 
 ):
     """Learn the mean and variance of multiple normalized gait cycles.
 
@@ -173,7 +173,7 @@ def learn_gait_distribution_gmr_kmp(
     kh, lambda_mean, lambda_covariance : float
         KMP kernel width and regularization parameters.
     via_indices : sequence of int, optional
-        Normalized sample indices at which KMP constraints are imposed.
+        Normalized sample indices at which KMP constraints are imposed. 
     via_points : array-like, optional
         Desired values with shape ``(n_via, n_signals)``.
     via_scale : float or sequence, optional
@@ -229,7 +229,7 @@ def learn_gait_distribution_gmr_kmp(
         nb_states=int(nb_states),
         input_dim=1,
         output_dim=n_signals,
-    )
+    )   
 
     if via_indices is None:
         via_indices_array = np.empty(0, dtype=int)
@@ -309,7 +309,7 @@ def learn_gait_distribution_gmr_kmp(
     }
 
 
-def build_parser():  
+def build_parser():   
     repository_root = Path(__file__).resolve().parents[1]  
     default_csv = repository_root / "RealData" / "exo_logs" / "hjc13.csv" 
     parser = argparse.ArgumentParser(
@@ -322,11 +322,11 @@ def build_parser():
     )
     parser.add_argument("--start-index", type=int, default=0)   
     parser.add_argument("--end-index", type=int)    
-    parser.add_argument("--gaits", type=int, default=10)  
-    parser.add_argument("--points", type=int, default=101) 
-    parser.add_argument("--states", type=int, default=5)  
-    parser.add_argument("--min-cycle-samples", type=int, default=60)  
-    parser.add_argument("--prominence", type=float)
+    parser.add_argument("--gaits", type=int, default=10)     
+    parser.add_argument("--points", type=int, default=101)    
+    parser.add_argument("--states", type=int, default=5)   
+    parser.add_argument("--min-cycle-samples", type=int, default=60)     
+    parser.add_argument("--prominence", type=float)   
     parser.add_argument("--extrema", choices=("max", "min"), default="max")
     parser.add_argument(
         "--via-indices", type=int, nargs="+", default=(0, 50, 100),
@@ -418,4 +418,4 @@ def main():
 
 
 if __name__ == "__main__": 
-    main()
+    main()  
