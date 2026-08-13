@@ -17,7 +17,7 @@ The network input at 100 Hz is:
 - Positive torque is hip-flexion torque.
 - A hardware sign is correct when lifting either thigh produces a positive angle.
 
-The exact controller interface is shown in `../inference_example.py`.
+The exact runtime interface is implemented in `../../NN_PC_Controller.py`.
 
 ## Files
 

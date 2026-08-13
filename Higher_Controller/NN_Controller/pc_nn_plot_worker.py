@@ -1,5 +1,5 @@
 """
-Standalone realtime plot worker for pc_nn_formal_controller_plotfix.py.
+Standalone realtime/offline plot worker for NN_PC_Controller.py.
 
 IMPORTANT:
     Realtime stdin mode does NOT import torch or the controller module. On
@@ -84,6 +84,7 @@ def run_offline_nn_plot(
     if not policy.available:
         raise RuntimeError(policy.load_message)  
     print(policy.load_message)
+    resolved_policy_type = policy.policy_type
     policy.reset()   
 
     with csv_path.open("r", newline="", encoding="utf-8-sig") as csv_file:
@@ -158,11 +159,11 @@ def run_offline_nn_plot(
     ax_torque.set_ylabel("Torque (Nm)")
     ax_torque.legend(loc="upper right", ncols=2)
     ax_torque.grid(True, alpha=0.25)
-    fig.suptitle(f"{csv_path.stem} - {policy_type} NN inference")
+    fig.suptitle(f"{csv_path.stem} - {resolved_policy_type} NN inference")
     fig.tight_layout()
 
     output_path = output_path or csv_path.with_name(
-        f"{csv_path.stem}_{policy_type}_nn_torque.png"
+        f"{csv_path.stem}_{resolved_policy_type}_nn_torque.png"
     )
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(output_path, dpi=300, bbox_inches="tight")
@@ -270,6 +271,7 @@ def run_expertdata_nn_plot(
     if not policy.available:
         raise RuntimeError(policy.load_message)
     print(policy.load_message)
+    resolved_policy_type = policy.policy_type
     policy.reset()
 
     retained = {
@@ -327,10 +329,15 @@ def run_expertdata_nn_plot(
     for axis in axes:
         axis.grid(True, alpha=0.25)
         axis.legend(frameon=False, ncols=2, loc="upper right")
-    figure.suptitle(f"{trial_dir.name} — {policy_type} NN torque from ExpertData")
+    figure.suptitle(
+        f"{trial_dir.name} — {resolved_policy_type} NN torque from ExpertData"
+    )
     figure.tight_layout()
 
-    output_path = output_path or trial_dir / f"{prefix}_{policy_type}_nn_torque.png"
+    output_path = (
+        output_path
+        or trial_dir / f"{prefix}_{resolved_policy_type}_nn_torque.png"
+    )
     output_path.parent.mkdir(parents=True, exist_ok=True)
     figure.savefig(output_path, dpi=300, bbox_inches="tight") 
     torque_csv_path = output_path.with_suffix(".csv")  
@@ -423,8 +430,8 @@ def main() -> None:
         help="Offline mode: infer from an ExpertData trial folder/angle CSV",
     )
     parser.add_argument(
-        "--policy", choices=("direct", "pd"), default="direct",
-        help="Neural-network policy used in offline mode (default: direct)",
+        "--policy", choices=("auto", "direct", "pd"), default="auto",
+        help="Optional checkpoint-interface validation (default: auto)",
     )
     parser.add_argument(
         "--model", type=Path,

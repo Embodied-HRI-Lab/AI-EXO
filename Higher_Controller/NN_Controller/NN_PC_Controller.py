@@ -67,13 +67,16 @@ With --arm:
 Examples
 --------
 Dry-run with terminal:
-    python pc_nn_formal_controller.py --display print
+    python NN_PC_Controller.py --display print
 
 Dry-run with realtime plot:
-    python pc_nn_formal_controller.py --display plot
+    python NN_PC_Controller.py --display plot
+
+Select any packaged checkpoint (MLP, GRU, or MoE):
+    python NN_PC_Controller.py --model models/slope_adam_lowtorque/uphill_direct_100hz.pt
 
 Real torque:
-    python pc_nn_formal_controller.py --display plot --arm
+    python NN_PC_Controller.py --display plot --arm
 
 Dependencies
 ------------
@@ -92,6 +95,12 @@ import sys
 import threading
 import time
 from collections import deque
+
+try:
+    import msvcrt  # Windows console non-blocking keyboard input
+except ImportError:
+    msvcrt = None
+
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -117,6 +126,12 @@ DEFAULT_CONTROL_HZ = 100.0
 DEFAULT_PRINT_HZ = 10.0
 DEFAULT_PLOT_HZ = 30.0
 DEFAULT_PLOT_WINDOW_S = 10.0
+
+# Final command = clamp(nominal NN torque * scale, +/-max_torque).
+DEFAULT_TORQUE_SCALE = 0.1
+DEFAULT_TORQUE_SCALE_STEP = 0.1
+MIN_TORQUE_SCALE = 0.1
+MAX_TORQUE_SCALE = 1.0
 
 DEFAULT_STALE_WARNING_S = 0.050
 DEFAULT_IMU_TIMEOUT_S = 0.150
@@ -863,8 +878,8 @@ TorqueCommand = Tuple[float, float]
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_MODEL_FILES = {
-    "direct": SCRIPT_DIR / "direct_exo_8frame.pt",
-    "pd": SCRIPT_DIR / "target_pd_exo_8frame.pt",
+    "direct": SCRIPT_DIR / "models" / "flat22" / "direct_100hz.pt",
+    "pd": SCRIPT_DIR / "models" / "flat22" / "target_pd_100hz.pt",
 }
 
 
@@ -884,7 +899,7 @@ class PolicyMLP(nn.Module):
         return self.network(value)  
 
 
-class NeuralTorqueInterface:
+class _FlatMLPTorqueInterface:
     """Stateful 100-Hz inference for either packaged Exo policy."""
 
     def __init__(
@@ -1097,6 +1112,348 @@ class NeuralTorqueInterface:
         self.last_error = ""
         self.valid_outputs += 1
         return left, right
+
+
+class RecurrentExoNetwork(nn.Module):
+    """Causal GRU backend shared by slope experts and learned-gate MoE."""
+
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_dim: int,
+        expert_count: int,
+        max_delta: float,
+        output_mode: str,
+    ) -> None:
+        super().__init__()
+        self.expert_count = int(expert_count)
+        self.max_delta = float(max_delta)
+        self.output_mode = str(output_mode)
+        self.gru = nn.GRU(int(input_dim), int(hidden_dim), batch_first=True)
+        self.expert_head = nn.Linear(int(hidden_dim), self.expert_count * 2)
+        self.gate_head = (
+            nn.Linear(int(hidden_dim), self.expert_count)
+            if self.expert_count > 1
+            else None
+        )
+
+    def step(
+        self,
+        normalized_input: torch.Tensor,
+        previous_exo: torch.Tensor,
+        hidden: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        features, hidden = self.gru(normalized_input[:, None], hidden)
+        features = features[:, 0]
+        raw = self.expert_head(features).reshape(-1, self.expert_count, 2)
+
+        if self.output_mode == "delta":
+            delta = self.max_delta * torch.tanh(raw)
+        elif self.output_mode == "absolute_slew":
+            target = torch.tanh(raw)
+            delta = torch.clamp(
+                target - previous_exo[:, None],
+                -self.max_delta,
+                self.max_delta,
+            )
+        else:
+            raise ValueError(
+                f"Unsupported recurrent output mode: {self.output_mode}"
+            )
+
+        expert_action = torch.clamp(
+            previous_exo[:, None] + delta,
+            -1.0,
+            1.0,
+        )
+        if self.gate_head is None:
+            return expert_action[:, 0], hidden, None
+
+        gate_logits = self.gate_head(features)
+        weights = torch.softmax(gate_logits, dim=-1)
+        action = torch.sum(weights[:, :, None] * expert_action, dim=1)
+        return action, hidden, gate_logits
+
+
+class _RecurrentTorqueInterface:
+    """Runtime adapter for recurrent Direct, target-PD, and learned MoE."""
+
+    def __init__(self, policy_type: str, model_path: Path) -> None:
+        self.policy_type = policy_type
+        self.model_path = model_path
+        self.model: Optional[RecurrentExoNetwork] = None
+        self.backend = "gru_moe"
+        self.model_type = ""
+        self.requires_torque_feedback = False
+        self.load_message = ""
+        self.last_error = ""
+        self.calls = 0
+        self.valid_outputs = 0
+        self.history_steps = 1
+        self.previous_normalized = torch.zeros((1, 2), dtype=torch.float32)
+        self.hidden: Optional[torch.Tensor] = None
+        self.last_gate = np.ones(1, dtype=np.float32)
+        self._load()
+
+    @property
+    def available(self) -> bool:
+        return self.model is not None
+
+    def _load(self) -> None:
+        try:
+            payload = torch.load(
+                self.model_path, map_location="cpu", weights_only=False
+            )
+            self.model_type = str(payload.get("model_type", ""))
+            expected = (
+                "recurrent_exo_target_pd"
+                if self.policy_type == "pd"
+                else "recurrent_exo"
+            )
+            if self.model_type != expected:
+                raise ValueError(
+                    f"Expected {expected}, found {self.model_type or 'unknown'}"
+                )
+            if float(payload.get("control_hz", -1.0)) != 100.0:
+                raise ValueError("Checkpoint is not explicitly marked as 100 Hz")
+            if str(payload.get("exo_sensor_mode", "")) != "hip4_exo6":
+                raise ValueError("Checkpoint must use hip4_exo6 input")
+            if int(payload["proprio_dim"]) != 6:
+                raise ValueError("Checkpoint must have proprio_dim=6")
+
+            self.history_steps = int(payload.get("history_steps", 1))
+            self.torque_scale_nm = float(payload.get("torque_scale_nm", 10.0))
+            self.mean = torch.as_tensor(
+                payload["proprio_mean"], dtype=torch.float32
+            )[None]
+            self.std = torch.as_tensor(
+                payload["proprio_std"], dtype=torch.float32
+            )[None]
+            self.expert_count = int(payload["expert_count"])
+            model = RecurrentExoNetwork(
+                input_dim=int(payload["proprio_dim"]),
+                hidden_dim=int(payload["hidden_dim"]),
+                expert_count=self.expert_count,
+                max_delta=float(payload["max_delta"]),
+                output_mode=str(payload.get("output_mode", "delta")),
+            )
+            model.load_state_dict(
+                payload["proprio_exo_state_dict"], strict=True
+            )
+            model.eval()
+            self.model = model
+            self.last_gate = np.full(
+                self.expert_count,
+                1.0 / self.expert_count,
+                dtype=np.float32,
+            )
+            if self.policy_type == "pd":
+                self.kp = float(payload["kp_nm_per_rad"])
+                self.kd = float(payload["kd_nm_s_per_rad"])
+                self.offset_limit = float(payload["target_offset_limit_rad"])
+                self.torque_limit_nm = float(payload["torque_limit_nm"])
+        except Exception as exc:
+            self.load_message = (
+                f"Failed to load {self.policy_type} recurrent model "
+                f"'{self.model_path}': {exc}. "
+                "The controller will output zero torque."
+            )
+            self.model = None
+            return
+
+        self.load_message = (
+            f"Loaded {self.policy_type} recurrent Exo policy: "
+            f"{self.model_path}"
+        )
+
+    def reset(self) -> None:
+        # The training data used the previous nominal Exo command, not measured
+        # motor torque. Runtime assistance scaling is therefore applied after
+        # get_torque(), while this unscaled recurrence stays inside the model.
+        self.previous_normalized.zero_()
+        self.hidden = None
+        if self.last_gate.size:
+            self.last_gate.fill(1.0 / self.last_gate.size)
+
+    def zero_state_test(self, steps: int = 40) -> Optional[TorqueCommand]:
+        old_calls = self.calls
+        old_valid_outputs = self.valid_outputs
+        old_error = self.last_error
+        self.reset()
+        result: Optional[TorqueCommand] = None
+        for _ in range(max(int(steps), self.history_steps, 1)):
+            result = self.get_torque((0.0, 0.0, 0.0, 0.0, 0.0, 0.0))
+            if result is None:
+                break
+        self.reset()
+        self.calls = old_calls
+        self.valid_outputs = old_valid_outputs
+        test_error = self.last_error
+        self.last_error = old_error
+        if result is None and test_error:
+            print(f"[NN ZERO TEST ERROR] {test_error}")
+        return result
+
+    def get_torque(self, observation: Observation) -> Optional[TorqueCommand]:
+        if self.model is None:
+            return None
+        self.calls += 1
+        try:
+            (
+                _left_actual_nm,
+                _right_actual_nm,
+                left_angle,
+                left_velocity,
+                right_angle,
+                right_velocity,
+            ) = observation
+            hip4 = np.asarray(
+                [right_angle, left_angle, right_velocity, left_velocity],
+                dtype=np.float32,
+            )
+            current = torch.cat(
+                (torch.from_numpy(hip4)[None], self.previous_normalized),
+                dim=1,
+            )
+            normalized = (current - self.mean) / self.std
+            with torch.inference_mode():
+                action, self.hidden, gate_logits = self.model.step(
+                    normalized,
+                    self.previous_normalized,
+                    self.hidden,
+                )
+            self.previous_normalized = action.detach()
+            if gate_logits is not None:
+                self.last_gate = torch.softmax(
+                    gate_logits[0], dim=-1
+                ).numpy()
+            right_left = action[0].numpy() * self.torque_scale_nm
+
+            if self.policy_type == "pd":
+                offset = (right_left - self.kd * hip4[2:]) / self.kp
+                if np.any(np.abs(offset) > self.offset_limit + 1.0e-6):
+                    raise RuntimeError("Requested recurrent PD offset exceeds limit")
+                right_left = np.clip(
+                    self.kp * offset + self.kd * hip4[2:],
+                    -self.torque_limit_nm,
+                    self.torque_limit_nm,
+                )
+            result = (float(right_left[1]), float(right_left[0]))
+            if not all(math.isfinite(value) for value in result):
+                raise ValueError("Output contains NaN or Inf")
+        except Exception as exc:
+            self.last_error = f"{type(exc).__name__}: {exc}"
+            return None
+
+        self.last_error = ""
+        self.valid_outputs += 1
+        return result
+
+
+class NeuralTorqueInterface:
+    """Auto-detecting facade for all packaged 100-Hz Exo checkpoints."""
+
+    def __init__(
+        self,
+        policy_type: str = "auto",
+        model_path: Optional[Path] = None,
+    ) -> None:
+        if policy_type not in {"auto", "direct", "pd"}:
+            raise ValueError("policy_type must be auto, direct, or pd")
+        requested = policy_type
+        default_policy = "direct" if requested == "auto" else requested
+        path = Path(model_path or DEFAULT_MODEL_FILES[default_policy])
+        self._delegate: Optional[object] = None
+        self.model_path = path
+        self.load_message = ""
+        self.model_type = ""
+        self.backend = ""
+        self.policy_type = default_policy
+        self.requires_torque_feedback = False
+
+        try:
+            payload = torch.load(path, map_location="cpu", weights_only=False)
+            self.model_type = str(payload.get("model_type", ""))
+            if self.model_type == "recurrent_exo":
+                inferred = "direct"
+                interface_type = _RecurrentTorqueInterface
+            elif self.model_type == "recurrent_exo_target_pd":
+                inferred = "pd"
+                interface_type = _RecurrentTorqueInterface
+            elif (
+                self.model_type == "shared_leg_target_position_pd"
+                or "kp_nm_per_rad" in payload
+            ):
+                inferred = "pd"
+                interface_type = _FlatMLPTorqueInterface
+            else:
+                inferred = "direct"
+                interface_type = _FlatMLPTorqueInterface
+
+            if requested != "auto" and requested != inferred:
+                raise ValueError(
+                    f"Checkpoint is {inferred}, but --policy {requested} "
+                    "was requested"
+                )
+            self.policy_type = inferred
+            delegate = interface_type(inferred, path)
+            if not delegate.available:
+                raise ValueError(delegate.load_message)
+            self._delegate = delegate
+            self.backend = delegate.backend if hasattr(delegate, "backend") else "mlp_history"
+            self.requires_torque_feedback = bool(
+                getattr(delegate, "requires_torque_feedback", inferred == "pd")
+            )
+            self.load_message = delegate.load_message
+        except Exception as exc:
+            self.load_message = (
+                f"Failed to load model '{path}': {exc}. "
+                "The controller will output zero torque."
+            )
+
+    @property
+    def available(self) -> bool:
+        return self._delegate is not None
+
+    @property
+    def model(self) -> Optional[nn.Module]:
+        return None if self._delegate is None else self._delegate.model
+
+    @property
+    def calls(self) -> int:
+        return 0 if self._delegate is None else self._delegate.calls
+
+    @property
+    def valid_outputs(self) -> int:
+        return 0 if self._delegate is None else self._delegate.valid_outputs
+
+    @property
+    def last_error(self) -> str:
+        return "" if self._delegate is None else self._delegate.last_error
+
+    @property
+    def history_steps(self) -> int:
+        return 1 if self._delegate is None else self._delegate.history_steps
+
+    @property
+    def last_gate(self) -> np.ndarray:
+        return np.ones(1, dtype=np.float32) if self._delegate is None else getattr(
+            self._delegate, "last_gate", np.ones(1, dtype=np.float32)
+        )
+
+    def reset(self) -> None:
+        if self._delegate is not None:
+            self._delegate.reset()
+
+    def zero_state_test(self, steps: int = 40) -> Optional[TorqueCommand]:
+        if self._delegate is None:
+            return None
+        return self._delegate.zero_state_test(steps)
+
+    def get_torque(self, observation: Observation) -> Optional[TorqueCommand]:
+        if self._delegate is None:
+            return None
+        return self._delegate.get_torque(observation)
 
 
 
@@ -1315,6 +1672,38 @@ class PlotSubprocess:
 
 
 # =============================================================================
+# Runtime keyboard control
+# =============================================================================
+
+def poll_torque_scale_keys(
+    current_scale: float,
+    step: float,
+) -> Tuple[float, bool]:
+    """Read Windows Up/Down keys without blocking the 100-Hz loop."""
+    if msvcrt is None:
+        return current_scale, False
+
+    updated = float(current_scale)
+    changed = False
+    while msvcrt.kbhit():
+        key = msvcrt.getwch()
+        if key not in ("\x00", "\xe0") or not msvcrt.kbhit():
+            continue
+        code = msvcrt.getwch()
+        if code == "H":
+            new_scale = min(MAX_TORQUE_SCALE, updated + step)
+        elif code == "P":
+            new_scale = max(MIN_TORQUE_SCALE, updated - step)
+        else:
+            continue
+        new_scale = round(new_scale, 4)
+        if abs(new_scale - updated) > 1.0e-12:
+            updated = new_scale
+            changed = True
+    return updated, changed
+
+
+# =============================================================================
 # CLI
 # =============================================================================
 
@@ -1404,13 +1793,33 @@ def build_parser() -> argparse.ArgumentParser:
 
     p.add_argument(
         "--policy",
-        choices=("direct", "pd"),
-        default="direct",
+        choices=("auto", "direct", "pd"),
+        default="auto",
+        help=(
+            "Checkpoint interface validation; auto infers it from --model "
+            "(default: auto, or flat Direct when --model is omitted)"
+        ),
     )
     p.add_argument(
         "--model",
         type=Path,
         default=None,
+    )
+
+    p.add_argument(
+        "--torque-scale",
+        type=float,
+        default=DEFAULT_TORQUE_SCALE,
+        help=(
+            "Initial nominal NN torque scale in [0.1, 1.0]; "
+            "Windows Up/Down changes it at runtime"
+        ),
+    )
+    p.add_argument(
+        "--torque-scale-step",
+        type=float,
+        default=DEFAULT_TORQUE_SCALE_STEP,
+        help="Runtime Up/Down torque-scale step (default: 0.1)",
     )
 
     # Current Teensy rejects inputs beyond +/-5 Nm, so PC default is matched.
@@ -1469,6 +1878,14 @@ def validate_args(a: argparse.Namespace) -> None:
         raise ValueError("--zero-samples must be positive")
     if a.zero_timeout <= 0:
         raise ValueError("--zero-timeout must be positive")
+
+    if not (MIN_TORQUE_SCALE <= a.torque_scale <= MAX_TORQUE_SCALE):
+        raise ValueError(
+            f"--torque-scale must be in "
+            f"[{MIN_TORQUE_SCALE:.1f}, {MAX_TORQUE_SCALE:.1f}]"
+        )
+    if a.torque_scale_step <= 0:
+        raise ValueError("--torque-scale-step must be positive")
 
     if a.max_torque <= 0 or a.max_torque > 5.0:
         raise ValueError(
@@ -1585,10 +2002,16 @@ def main() -> None:
         "CSV/plot remain deg and deg/s"
     )
     print(
-        f"Policy    : {a.policy} | "
+        f"Policy    : {policy.policy_type} | backend={policy.backend or 'none'} | "
         f"{'READY' if policy.available else 'MISSING'}"
     )
     print(policy.load_message)
+    print(
+        f"NN scale  : {a.torque_scale:.1f} "
+        f"(range {MIN_TORQUE_SCALE:.1f}-{MAX_TORQUE_SCALE:.1f}, "
+        f"step {a.torque_scale_step:.1f})"
+    )
+    print("Keys      : Up = scale +step | Down = scale -step")
     print(f"PC clamp  : +/-{a.max_torque:.3f} Nm")
     print(f"Output    : {'ARMED' if a.arm else 'DRY RUN - zero torque sent'}")
     print(f"CSV       : {csv_path}")
@@ -1699,6 +2122,7 @@ def main() -> None:
     lcmd = 0.0
     rcmd = 0.0
     enabled = False
+    torque_scale = float(a.torque_scale)
 
     prev_control_ok = False
     last_nn_error_print = ""
@@ -1733,6 +2157,13 @@ def main() -> None:
                 if plotter is not None and plotter.closed:
                     print("\nPlot window closed.")
                     break
+
+                torque_scale, scale_changed = poll_torque_scale_keys(
+                    torque_scale,
+                    a.torque_scale_step,
+                )
+                if scale_changed:
+                    print(f"\n[SCALE] NN torque scale -> {torque_scale:.2f}")
 
                 now = time.perf_counter()
 
@@ -1843,15 +2274,15 @@ def main() -> None:
                         and not teensy_timeout
                     )
 
-                    # DIRECT policy ignores actual torque internally, so keep
-                    # calculating/recording NN command even if Teensy feedback
-                    # drops out.  PD policy DOES use actual torque, therefore
-                    # fresh Teensy feedback remains mandatory for PD inference.
+                    # Only the flat target-PD MLP uses measured motor torque as
+                    # a network input. Recurrent checkpoints retain their own
+                    # unscaled nominal command state.
                     nn_input_ok = (
                         imu_ok
                         and policy.available
+                        and (not a.arm or teensy_ok)
                         and (
-                            a.policy == "direct"
+                            not policy.requires_torque_feedback
                             or teensy_ok
                         )
                     )
@@ -1889,13 +2320,15 @@ def main() -> None:
                             rcmd = 0.0
                             policy.reset()
                         else:
+                            scaled_left_nm = neural_output[0] * torque_scale
+                            scaled_right_nm = neural_output[1] * torque_scale
                             lcmd = max(
                                 -a.max_torque,
-                                min(a.max_torque, neural_output[0]),
+                                min(a.max_torque, scaled_left_nm),
                             )
                             rcmd = max(
                                 -a.max_torque,
-                                min(a.max_torque, neural_output[1]),
+                                min(a.max_torque, scaled_right_nm),
                             )
                             nn_valid = True
                     else:
@@ -2051,6 +2484,7 @@ def main() -> None:
                         f"T {teensy_stats.hz:5.1f}Hz "
                         f"age={teensy_age*1000:6.1f}ms "
                         f"[{teensy_state}] | "
+                        f"SCALE={torque_scale:.2f} | "
                         f"CMD={lcmd:+.4f}/{rcmd:+.4f} | "
                         f"ACT={actual_text} | "
                         f"NN={'OK' if control_ok else 'ZERO'} | "
@@ -2134,6 +2568,7 @@ def main() -> None:
             f"NN inference  : calls={policy.calls}, "
             f"valid={policy.valid_outputs}"
         )
+        print(f"Final NN scale: {torque_scale:.2f}")
 
         if left_imu.error:
             print("LEFT IMU error :", left_imu.error)

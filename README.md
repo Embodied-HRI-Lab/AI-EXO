@@ -37,7 +37,7 @@ Teensy lower-level controller
 Bilateral hip motors
 ```
 
-The neural-network observation is:
+The hardware observation tuple exposed to a policy is:
 
 ```text
 [
@@ -50,7 +50,10 @@ The neural-network observation is:
 ]
 ```
 
-The policy outputs left and right assistive torque commands in Nm. Logged and
+Flat target-PD uses measured torque; flat Direct and recurrent slope policies
+use the four hip-kinematic values, with recurrent policies maintaining their
+own preceding nominal command internally. The policy outputs left and right
+assistive torque commands in Nm. Logged and
 plotted angles remain in degrees and angular velocities in degrees per second;
 conversion to SI units occurs immediately before neural-network inference.
 
@@ -60,10 +63,11 @@ conversion to SI units occurs immediately before neural-network inference.
 AI-EXO/
 ├── Higher_Controller/
 │   ├── NN_Controller/
-│   │   ├── NN_PC_Controller.py       # 100 Hz neural policy controller
+│   │   ├── README.md                  # model selection and safety notes
+│   │   ├── NN_PC_Controller.py       # unified 100 Hz MLP/GRU/MoE controller
 │   │   ├── pc_nn_plot_worker.py      # realtime/offline NN visualization
-│   │   ├── direct_exo_8frame.pt      # direct-torque policy
-│   │   └── target_pd_exo_8frame.pt   # target-offset PD policy
+│   │   ├── models/                    # flat and alternative slope checkpoints
+│   │   └── validation/                # offline controller validation artifacts
 │   ├── IMU_logger.py                  # bilateral IM948 data logger
 │   ├── samsung_pc_controller.py       # conventional control baseline
 │   ├── Raspberry_Pi_Controller.py     # Raspberry Pi communication layer
@@ -84,7 +88,7 @@ AI-EXO/
 
 - Independent serial threads for the left IMU, right IMU, and Teensy feedback.
 - Startup calibration of standing hip angle and static gyroscope bias.
-- Stateful 100 Hz inference using direct-torque or target-offset PD policies.
+- Auto-detected 100 Hz MLP, recurrent GRU, and learned-gate MoE inference.
 - Dry-run operation by default, with explicit arming required for motor torque.
 - Torque clamps, slew-rate limits, communication timeouts, and fault handling.
 - CSV logging of joint kinematics, actual torque, and neural torque commands.
@@ -139,8 +143,7 @@ Dry-run mode performs inference and logging but sends zero torque:
 
 ```bash
 python Higher_Controller/NN_Controller/NN_PC_Controller.py \
-  --display plot \
-  --policy direct
+  --display plot
 ```
 
 Override the serial ports when necessary:
@@ -150,8 +153,7 @@ python Higher_Controller/NN_Controller/NN_PC_Controller.py \
   --left-port COM8 \
   --right-port COM6 \
   --teensy-port COM7 \
-  --display plot \
-  --policy direct
+  --display plot
 ```
 
 Only after verifying calibration, communication, motor direction, emergency
@@ -160,7 +162,6 @@ stop behavior, and dry-run outputs should torque transmission be enabled:
 ```bash
 python Higher_Controller/NN_Controller/NN_PC_Controller.py \
   --display plot \
-  --policy direct \
   --arm
 ```
 
@@ -172,7 +173,7 @@ torque against measured torque:
 ```bash
 python Higher_Controller/NN_Controller/pc_nn_plot_worker.py \
   --csv Higher_Controller/logs/hjc07.csv \
-  --policy direct \
+  --policy auto \
   --output Data/figures/hjc07_nn_torque.png \
   --show
 ```
@@ -199,16 +200,19 @@ Generated analysis figures are saved under `Data/figures/` and ignored by Git.
 
 ## Neural policies
 
-Two packaged policy variants are available:
+The unified controller auto-detects four checkpoint interfaces:
 
-| Policy | Checkpoint | Output interpretation |
+| Backend | Checkpoint metadata | Output interpretation |
 |---|---|---|
-| `direct` | `direct_exo_8frame.pt` | Direct left/right torque command |
-| `pd` | `target_pd_exo_8frame.pt` | Learned target offset converted through PD control |
+| Flat MLP Direct | `direct_exo_kinematic_history` | Bilateral torque command |
+| Flat MLP target-PD | `shared_leg_target_position_pd` | Target offset converted to torque |
+| Slope GRU/MoE Direct | `recurrent_exo` | Stateful bilateral torque command |
+| Slope GRU/MoE target-PD | `recurrent_exo_target_pd` | Equivalent target-PD command reconstructed as torque |
 
-Both policies use an eight-frame observation history and require a 100 Hz
-control rate. Model metadata stored in each checkpoint defines normalization,
-network dimensions, torque scaling, and per-step output limits.
+The model tree contains two flat checkpoints and two alternative six-checkpoint
+slope families. All checkpoints require a 100 Hz control rate. See
+`Higher_Controller/NN_Controller/README.md` for model selection and safety
+notes.
 
 ## Data format
 
