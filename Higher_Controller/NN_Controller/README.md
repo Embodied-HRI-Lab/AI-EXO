@@ -58,5 +58,4 @@ motor direction, communication timeouts, and emergency-stop behavior.
 `pc_nn_plot_worker.py` is kept separate so plotting cannot block the 100-Hz
 control loop. The `validation/` directory contains offline evidence and is not
 required in a minimal hardware copy. Runtime CSV files are written under
-`logs/`, which is intentionally ignored by Git. After copying models, run
-`cd models && sha256sum -c SHA256SUMS` to verify them.
+`logs/`, which is intentionally ignored by Git.
