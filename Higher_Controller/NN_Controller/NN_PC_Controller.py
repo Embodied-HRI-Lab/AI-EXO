@@ -72,8 +72,8 @@ Dry-run with terminal:
 Dry-run with realtime plot:
     python NN_PC_Controller.py --display plot
 
-Select any packaged checkpoint (MLP, GRU, or MoE):
-    python NN_PC_Controller.py --model models/slope_adam_lowtorque/uphill_direct_100hz.pt
+Select a packaged checkpoint:
+    python NN_PC_Controller.py --model models/weighted_activation_direct_100hz.pt
 
 Real torque:
     python NN_PC_Controller.py --display plot --arm
@@ -878,8 +878,8 @@ TorqueCommand = Tuple[float, float]
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_MODEL_FILES = {
-    "direct": SCRIPT_DIR / "models" / "flat22" / "direct_100hz.pt",
-    "pd": SCRIPT_DIR / "models" / "flat22" / "target_pd_100hz.pt",
+    "direct": SCRIPT_DIR / "models" / "weighted_activation_direct_100hz.pt",
+    "pd": SCRIPT_DIR / "models" / "weighted_activation_target_pd_100hz.pt",
 }
 
 
@@ -936,6 +936,20 @@ class _FlatMLPTorqueInterface:
             )
             self.torque_scale_nm = float(payload.get("torque_scale_nm", 10.0))
             self.max_delta_nm = float(payload["max_delta_nm_per_step"])
+            self.per_frame_input_dim = int(
+                payload.get(
+                    "per_frame_input_dim",
+                    len(self.input_mean) // self.history_steps,
+                )
+            )
+            if self.per_frame_input_dim not in (4, 6):
+                raise ValueError(
+                    "Flat Direct input must contain four hip kinematics, "
+                    "optionally followed by two normalized Exo torques"
+                )
+            if len(self.input_mean) != self.history_steps * self.per_frame_input_dim:
+                raise ValueError("Flat policy input metadata has inconsistent dimensions")
+            self.requires_torque_feedback = self.per_frame_input_dim == 6
             output_dim = 2 if self.policy_type == "direct" else 1
             self.model = PolicyMLP(
                 len(self.input_mean), int(payload["hidden_dim"]), output_dim
@@ -1031,7 +1045,13 @@ class _FlatMLPTorqueInterface:
         # zeroed IMU readings with math.radians() before calling get_torque().
 
         if self.policy_type == "direct":
-            history = self._append_history(hip4)
+            frame = hip4
+            if self.per_frame_input_dim == 6:
+                actual_normalized = np.asarray(
+                    [right_actual_nm, left_actual_nm], dtype=np.float32
+                ) / self.torque_scale_nm
+                frame = np.concatenate((hip4, actual_normalized))
+            history = self._append_history(frame)
             features = history.reshape(-1)
             normalized = torch.from_numpy(
                 (features - self.input_mean) / self.input_std

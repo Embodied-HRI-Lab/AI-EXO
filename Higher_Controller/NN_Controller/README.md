@@ -1,11 +1,8 @@
 # Unified 100-Hz neural controller
 
-`NN_PC_Controller.py` is the only hardware controller. It reads checkpoint
-metadata and automatically selects the correct inference backend:
-
-- flat-ground eight-frame MLP Direct or target-PD;
-- recurrent slope GRU Direct or target-PD;
-- recurrent two-expert slope MoE Direct or target-PD.
+`NN_PC_Controller.py` is the hardware controller. The currently packaged model
+is the flat-ground weighted-activation Direct policy distilled from the
+trajectory optimizer.
 
 All checkpoints consume hip flexion/extension kinematics at 100 Hz. Model-side
 ordering is right then left; the controller converts this to the Teensy UART
@@ -15,20 +12,14 @@ ordering of left then right.
 
 ```text
 models/
-├── flat22/                    # 2 flat-ground MLP checkpoints
-├── slope_free_slew05/         # 6 native-100-Hz, high-torque checkpoints
-└── slope_adam_lowtorque/      # 6 lower-torque checkpoints
+└── weighted_activation_direct_100hz.pt
 ```
 
-Each slope directory contains uphill, downhill, and learned-gate MoE policies,
-with Direct and target-PD versions of each. The two slope directories are
-alternative lineages, not stages that should be run together.
-
-`slope_free_slew05` closely reproduces its native-100-Hz optimization teacher,
-but its mean absolute command is roughly 6.5--6.7 Nm and will be clipped by the
-current Teensy limit of 5 Nm at high assistance scale. `slope_adam_lowtorque`
-has mean absolute commands around 0.68--1.70 Nm and is the safer first hardware
-candidate, although its held-out teacher correlation is lower.
+The model uses eight causal frames at 100 Hz. Each frame contains right/left
+hip angle, right/left hip angular velocity, and right/left measured Exo torque
+normalized by 10 Nm. It outputs nominal right/left hip torque and applies a
+0.5 Nm-per-frame slew limit. It was trained from the flat-ground solver whose
+objective is muscle-mass/volume-weighted mean activation.
 
 ## Run
 
@@ -44,7 +35,7 @@ checkpoint declares Direct or target-PD itself:
 
 ```bash
 python NN_PC_Controller.py \
-  --model models/slope_adam_lowtorque/uphill_direct_100hz.pt \
+  --model models/weighted_activation_direct_100hz.pt \
   --display plot
 ```
 
