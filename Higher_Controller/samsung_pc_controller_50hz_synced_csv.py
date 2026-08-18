@@ -11,8 +11,8 @@ Thread/process architecture
 ---------------------------
 Main thread:
     - 100 Hz Samsung calculation
-    - 100 Hz command TX to Teensy
-    - 100 Hz CSV logging
+    - 50 Hz command TX to Teensy
+    - ~100 Hz single-CSV recording driven by paired raw IMU packets
 
 Thread 1:
     - LEFT IM948 only (COM7)
@@ -25,8 +25,8 @@ Thread 3:
 
 Main thread:
     - 100 Hz Samsung calculation
-    - 100 Hz torque TX to Teensy
-    - 100 Hz compact CSV logging
+    - 50 Hz torque TX to Teensy
+    - raw-packet-preserving synchronized CSV logging
 
 Optional separate process:
     - Matplotlib realtime plot
@@ -42,11 +42,23 @@ Each IMU has its own sample timestamp and sequence counter.
 The display angle is NOT replaced with NaN during timeout. The plot therefore
 stays continuous and you can directly see which IMU is holding its last value.
 
-Formal CSV keeps only the signals required for experiment recording:
-    elapsed_s
-    left_angle_x_deg / right_angle_x_deg
-    left_angular_velocity_x_dps / right_angular_velocity_x_dps
-    left_actual_torque_nm / right_actual_torque_nm
+A SINGLE formal CSV is used. Its IMU rows are driven by paired real IMU
+packets instead of the 100 Hz control snapshot, so intermediate IMU packets are
+not silently overwritten.
+
+The CSV contains:
+    elapsed_s                  : host-time of the paired IMU samples
+    imu_time_100hz_s           : packet-order 100 Hz IMU timeline
+    left/right angle-X
+    left/right gyro-X
+    left/right command torque actually sent to Teensy
+    left/right actual motor torque
+    IMU sequence / arrival timing / pairing skew
+    command and feedback ages for alignment diagnostics
+
+Torque is aligned to each raw IMU pair using host timestamps:
+    command = latest command sent at or before the IMU pair arrival time
+    actual  = latest Teensy STATE at or before the IMU pair arrival time
 
 All CSV numeric values are written with exactly 4 decimal places.
 
@@ -125,6 +137,8 @@ DEFAULT_TEENSY_PORT = "COM10"
 DEFAULT_BAUD = 115200
 
 DEFAULT_CONTROL_HZ = 100.0
+DEFAULT_TEENSY_TX_HZ = 50.0
+DEFAULT_IMU_RECORD_HZ = 100.0
 DEFAULT_PRINT_HZ = 10.0
 DEFAULT_PLOT_HZ = 30.0
 DEFAULT_PLOT_WINDOW_S = 10.0
@@ -165,7 +179,7 @@ CONTROL_AXIS = "X"
 
 ANGLE_SCALE_DEG = 180.0 / 32768.0
 GYRO_SCALE_DPS = 2000.0 / 32768.0
-MAX_IMU_DATA_LEN = 128  
+MAX_IMU_DATA_LEN = 128
 
 
 @dataclass(frozen=True)
@@ -384,11 +398,31 @@ class SingleImuReader(threading.Thread):
         self._latest: ImuSample | None = None
         self._stats = ImuStats()
 
+        # Every valid raw IMU packet is also kept here until the main thread
+        # pairs LEFT/RIGHT samples for the single experiment CSV.
+        # This prevents `_latest` from silently discarding intermediate packets.
+        self._pending: deque[ImuSample] = deque(maxlen=5000)
+        self.pending_drops = 0
+
         self.error = ""
 
     def snapshot(self) -> tuple[ImuSample | None, ImuStats]:
         with self._lock:
             return self._latest, ImuStats(**vars(self._stats))
+
+    def clear_pending(self) -> None:
+        with self._lock:
+            self._pending.clear()
+
+    def pop_pending(self) -> ImuSample | None:
+        with self._lock:
+            if not self._pending:
+                return None
+            return self._pending.popleft()
+
+    def pending_count(self) -> int:
+        with self._lock:
+            return len(self._pending)
 
     def run(self) -> None:
         uart: serial.Serial | None = None
@@ -441,6 +475,10 @@ class SingleImuReader(threading.Thread):
                         with self._lock:
                             self._latest = sample
                             self._stats.total_samples += 1
+
+                            if len(self._pending) == self._pending.maxlen:
+                                self.pending_drops += 1
+                            self._pending.append(sample)
 
                 now = time.perf_counter()
 
@@ -508,6 +546,23 @@ class TeensyStats:
     crc_errors: int = 0
 
 
+@dataclass(frozen=True)
+class SentTorqueCommand:
+    host_time: float
+    left_nm: float
+    right_nm: float
+    enabled: bool
+    tx_sequence: int
+
+
+def latest_at_or_before(history, target_time: float):
+    """Return newest history item whose host_time <= target_time."""
+    for item in reversed(history):
+        if item.host_time <= target_time:
+            return item
+    return None
+
+
 class TeensyLink(threading.Thread):
     def __init__(
         self,
@@ -529,6 +584,11 @@ class TeensyLink(threading.Thread):
         self.latest: MotorFeedback | None = None
         self.stats = TeensyStats()
 
+        # Preserve each valid 50 Hz Teensy STATE long enough to align it to
+        # raw IMU rows by host timestamp.
+        self._feedback_pending: deque[MotorFeedback] = deque(maxlen=5000)
+        self.feedback_pending_drops = 0
+
         self.rx = bytearray()
         self.tx_seq = 0
         self.error = ""
@@ -536,6 +596,12 @@ class TeensyLink(threading.Thread):
     def snapshot(self) -> tuple[MotorFeedback | None, TeensyStats]:
         with self._lock:
             return self.latest, TeensyStats(**vars(self.stats))
+
+    def drain_feedback(self) -> list[MotorFeedback]:
+        with self._lock:
+            items = list(self._feedback_pending)
+            self._feedback_pending.clear()
+            return items
 
     def send_torque(
         self,
@@ -628,6 +694,10 @@ class TeensyLink(threading.Thread):
             with self._lock:
                 self.latest = feedback
                 self.stats.packets += 1
+
+                if len(self._feedback_pending) == self._feedback_pending.maxlen:
+                    self.feedback_pending_drops += 1
+                self._feedback_pending.append(feedback)
 
             count += 1
 
@@ -909,15 +979,15 @@ class SamsungController:
         now: float,
     ) -> tuple[float, float]:
         # Inputs are already standing-zeroed, wrapped, and direction-normalized.
-        left = math.radians(left_angle_deg)  
-        right = math.radians(right_angle_deg)  
+        left = math.radians(left_angle_deg)
+        right = math.radians(right_angle_deg)
 
         if self.last_time is None:
             dt = 1.0 / DEFAULT_CONTROL_HZ
         else:
             dt = max(0.001, min(now - self.last_time, 0.05))
 
-        self.last_time = now  
+        self.last_time = now
 
         if self.left_filtered is None:
             self.left_filtered = left
@@ -968,10 +1038,10 @@ class SamsungController:
             current_index - delay
         ) % self.HISTORY_SIZE
 
-        delayed_phase = self.phase_history[delayed_index]   
-        delayed_shape = self.shape_history[delayed_index]   
+        delayed_phase = self.phase_history[delayed_index]
+        delayed_shape = self.shape_history[delayed_index]
 
-        phase_limit = math.radians(120.0)  
+        phase_limit = math.radians(120.0)
 
         if 0.0 <= delayed_phase < phase_limit:
             left_tau = (
@@ -1336,6 +1406,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--rate",
         type=float,
         default=DEFAULT_CONTROL_HZ,
+        help="Samsung/control calculation rate; default 100 Hz",
+    )
+    p.add_argument(
+        "--teensy-tx-rate",
+        type=float,
+        default=DEFAULT_TEENSY_TX_HZ,
+        help="PC -> Teensy torque command rate; default 50 Hz",
     )
 
     p.add_argument(
@@ -1472,6 +1549,8 @@ def validate_args(a: argparse.Namespace) -> None:
 
     if a.rate <= 0:
         raise ValueError("--rate must be positive")
+    if a.teensy_tx_rate <= 0:
+        raise ValueError("--teensy-tx-rate must be positive")
     if a.print_rate <= 0:
         raise ValueError("--print-rate must be positive")
     if a.plot_rate <= 0:
@@ -1589,7 +1668,7 @@ def main() -> None:
         )
 
     print("=" * 104)
-    print("Samsung PC / dual independent IMU / Teensy controller")
+    print("Samsung PC / dual IMU 100 Hz / Teensy 50 Hz controller")
     print(
         f"LEFT IMU  : {a.left_port} @ {a.baud} "
         f"(independent thread)"
@@ -1602,7 +1681,14 @@ def main() -> None:
         f"Teensy    : {a.teensy_port} @ {a.baud} "
         f"(independent thread)"
     )
-    print(f"Control   : {a.rate:.1f} Hz | CSV target={a.rate:.1f} Hz")
+    print(
+        f"Control   : {a.rate:.1f} Hz Samsung calculation | "
+        f"Teensy TX={a.teensy_tx_rate:.1f} Hz"
+    )
+    print(
+        "CSV       : single file, paired raw IMU packets (~100 Hz); "
+        "torque aligned by host timestamp"
+    )
 
     if a.display == "print":
         print(f"Display   : PRINT @ {a.print_rate:.1f} Hz")
@@ -1651,9 +1737,9 @@ def main() -> None:
     print("=" * 104)
 
     # Start all communication threads.
-    left_imu.start()  
-    right_imu.start()  
-    teensy.start()  
+    left_imu.start()
+    right_imu.start()
+    teensy.start()
 
     # Wait for one valid sample from each IMU.
     startup_deadline = time.perf_counter() + 7.0
@@ -1695,21 +1781,42 @@ def main() -> None:
             stop_event=stop_event,
         )
 
+    # Discard packets collected during zeroing. From here on, every pending
+    # packet belongs to the experiment recording interval.
+    left_imu.clear_pending()
+    right_imu.clear_pending()
+    teensy.drain_feedback()
+
     # Start GUI only after zero calibration.
     if plot_process is not None:
         plot_process.start()
 
     period = 1.0 / a.rate
+    teensy_tx_period = 1.0 / a.teensy_tx_rate
     print_period = 1.0 / a.print_rate
 
     start_time = time.perf_counter()
     next_tick = start_time
+    next_teensy_tx = start_time
     next_print = start_time
 
     last_left_seq = -1
     last_right_seq = -1
 
     rows = 0
+    control_ticks = 0
+    teensy_tx_packets = 0
+
+    # Histories are only a few seconds deep in practice, but long enough to
+    # survive short communication bursts. They are used solely to align
+    # command/feedback with raw IMU packet arrival times in the single CSV.
+    command_history: deque[SentTorqueCommand] = deque(maxlen=5000)
+    feedback_history: deque[MotorFeedback] = deque(maxlen=10000)
+
+    last_sent_left_nm = 0.0
+    last_sent_right_nm = 0.0
+    last_sent_enabled = False
+
     left_stale_rows = 0
     right_stale_rows = 0
     left_timeout_rows = 0
@@ -1733,13 +1840,34 @@ def main() -> None:
 
             writer.writerow(
                 [
+                    # Host time is the time used to align torque to IMU.
                     "elapsed_s",
+                    # Packet-order IMU time is exactly 0.01 s per paired sample.
+                    "imu_time_100hz_s",
+
                     "left_angle_x_deg",
                     "left_angular_velocity_x_dps",
                     "right_angle_x_deg",
                     "right_angular_velocity_x_dps",
+
+                    # Command ACTUALLY transmitted to Teensy at 50 Hz,
+                    # zero-order-held onto the raw IMU row.
+                    "left_cmd_torque_nm",
+                    "right_cmd_torque_nm",
+
+                    # Latest valid Teensy actual torque at/before this IMU row.
                     "left_actual_torque_nm",
                     "right_actual_torque_nm",
+
+                    # Alignment/audit columns.
+                    "left_imu_sequence",
+                    "right_imu_sequence",
+                    "left_imu_arrival_s",
+                    "right_imu_arrival_s",
+                    "imu_pair_skew_ms",
+                    "cmd_age_ms",
+                    "actual_age_ms",
+                    "cmd_enabled",
                 ]
             )
 
@@ -1915,12 +2043,53 @@ def main() -> None:
                         and teensy_ok
                     )
 
-                    # Default no --enable: send zero torque and enable=0.
-                    teensy.send_torque(
-                        lcmd if enabled else 0.0,
-                        rcmd if enabled else 0.0,
-                        enabled,
+                    # ---------------------------------------------------------
+                    # PC -> Teensy is deliberately limited to 50 Hz.
+                    # The Samsung law still runs at 100 Hz; every 20 ms the
+                    # newest 100 Hz command is selected and transmitted.
+                    #
+                    # Safety exception: if a previously enabled command must
+                    # become disabled, send zero immediately rather than wait
+                    # for the next 20 ms slot.
+                    # ---------------------------------------------------------
+                    force_zero_now = (
+                        last_sent_enabled
+                        and not enabled
                     )
+
+                    if now >= next_teensy_tx or force_zero_now:
+                        sent_left_nm = lcmd if enabled else 0.0
+                        sent_right_nm = rcmd if enabled else 0.0
+
+                        tx_sequence = teensy.tx_seq
+                        teensy.send_torque(
+                            sent_left_nm,
+                            sent_right_nm,
+                            enabled,
+                        )
+
+                        command_history.append(
+                            SentTorqueCommand(
+                                host_time=now,
+                                left_nm=sent_left_nm,
+                                right_nm=sent_right_nm,
+                                enabled=enabled,
+                                tx_sequence=tx_sequence,
+                            )
+                        )
+
+                        last_sent_left_nm = sent_left_nm
+                        last_sent_right_nm = sent_right_nm
+                        last_sent_enabled = enabled
+                        teensy_tx_packets += 1
+
+                        if force_zero_now:
+                            next_teensy_tx = now + teensy_tx_period
+                        else:
+                            next_teensy_tx += teensy_tx_period
+
+                            if now - next_teensy_tx > teensy_tx_period:
+                                next_teensy_tx = now + teensy_tx_period
 
                     left_actual = (
                         feedback.left_actual_nm
@@ -1934,43 +2103,7 @@ def main() -> None:
                     )
 
                     elapsed = now - start_time
-
-                    writer.writerow(
-                        [
-                            f"{elapsed:.4f}",
-                            (
-                                f"{left_rel_deg:.4f}"
-                                if math.isfinite(left_rel_deg)
-                                else ""
-                            ),
-                            (
-                                f"{left_rel_gyro_dps:.4f}"
-                                if math.isfinite(left_rel_gyro_dps)
-                                else ""
-                            ),
-                            (
-                                f"{right_rel_deg:.4f}"
-                                if math.isfinite(right_rel_deg)
-                                else ""
-                            ),
-                            (
-                                f"{right_rel_gyro_dps:.4f}"
-                                if math.isfinite(right_rel_gyro_dps)
-                                else ""
-                            ),
-                            (
-                                f"{left_actual:.4f}"
-                                if math.isfinite(left_actual)
-                                else ""
-                            ),
-                            (
-                                f"{right_actual:.4f}"
-                                if math.isfinite(right_actual)
-                                else ""
-                            ),
-                        ]
-                    )
-                    rows += 1
+                    control_ticks += 1
 
                     if plot_queue is not None:
                         push_plot_sample(
@@ -1997,6 +2130,155 @@ def main() -> None:
                     # this process. Resume from the current time.
                     if now - next_tick > period:
                         next_tick = now + period
+
+                # -------------------------------------------------------------
+                # Preserve every Teensy feedback frame for timestamp alignment.
+                # -------------------------------------------------------------
+                for feedback_item in teensy.drain_feedback():
+                    feedback_history.append(feedback_item)
+
+                # -------------------------------------------------------------
+                # SINGLE CSV, raw-IMU driven.
+                #
+                # Pair the oldest unread LEFT/RIGHT real IMU packets. This keeps
+                # intermediate packets that `_latest`-based 100 Hz logging would
+                # otherwise skip. Several rows may be written quickly after a
+                # USB/wireless burst, but imu_time_100hz_s remains 0.01 s apart.
+                #
+                # Torque is NOT aligned to synthetic imu_time_100hz_s. Instead,
+                # it is associated using real host arrival timestamps:
+                #   row_host_time = max(left arrival, right arrival)
+                #   cmd/actual = latest event at or before row_host_time
+                # -------------------------------------------------------------
+                while (
+                    left_imu.pending_count() > 0
+                    and right_imu.pending_count() > 0
+                ):
+                    left_raw = left_imu.pop_pending()
+                    right_raw = right_imu.pop_pending()
+
+                    if left_raw is None or right_raw is None:
+                        break
+
+                    row_host_time = max(
+                        left_raw.host_time,
+                        right_raw.host_time,
+                    )
+
+                    # Ignore any sample that somehow predates formal recording.
+                    if row_host_time < start_time:
+                        continue
+
+                    left_raw_rel_deg = relative_x_deg(
+                        left_raw.angle_x_deg,
+                        left_zero.angle_x_deg,
+                        a.left_angle_sign,
+                    )
+                    right_raw_rel_deg = relative_x_deg(
+                        right_raw.angle_x_deg,
+                        right_zero.angle_x_deg,
+                        a.right_angle_sign,
+                    )
+
+                    left_raw_gyro = relative_x_gyro_dps(
+                        left_raw.gyro_x_dps,
+                        left_zero.gyro_x_dps,
+                        a.left_angle_sign,
+                    )
+                    right_raw_gyro = relative_x_gyro_dps(
+                        right_raw.gyro_x_dps,
+                        right_zero.gyro_x_dps,
+                        a.right_angle_sign,
+                    )
+
+                    aligned_cmd = latest_at_or_before(
+                        command_history,
+                        row_host_time,
+                    )
+                    aligned_feedback = latest_at_or_before(
+                        feedback_history,
+                        row_host_time,
+                    )
+
+                    if aligned_cmd is not None:
+                        csv_left_cmd = aligned_cmd.left_nm
+                        csv_right_cmd = aligned_cmd.right_nm
+                        cmd_age_ms = (
+                            row_host_time - aligned_cmd.host_time
+                        ) * 1000.0
+                        csv_cmd_enabled = int(aligned_cmd.enabled)
+                    else:
+                        csv_left_cmd = math.nan
+                        csv_right_cmd = math.nan
+                        cmd_age_ms = math.nan
+                        csv_cmd_enabled = 0
+
+                    if aligned_feedback is not None:
+                        csv_left_actual = aligned_feedback.left_actual_nm
+                        csv_right_actual = aligned_feedback.right_actual_nm
+                        actual_age_ms = (
+                            row_host_time - aligned_feedback.host_time
+                        ) * 1000.0
+                    else:
+                        csv_left_actual = math.nan
+                        csv_right_actual = math.nan
+                        actual_age_ms = math.nan
+
+                    row_elapsed = row_host_time - start_time
+                    imu_time_100hz_s = rows / DEFAULT_IMU_RECORD_HZ
+                    left_arrival_s = left_raw.host_time - start_time
+                    right_arrival_s = right_raw.host_time - start_time
+                    pair_skew_ms = abs(
+                        left_raw.host_time - right_raw.host_time
+                    ) * 1000.0
+
+                    writer.writerow(
+                        [
+                            f"{row_elapsed:.4f}",
+                            f"{imu_time_100hz_s:.4f}",
+                            f"{left_raw_rel_deg:.4f}",
+                            f"{left_raw_gyro:.4f}",
+                            f"{right_raw_rel_deg:.4f}",
+                            f"{right_raw_gyro:.4f}",
+                            (
+                                f"{csv_left_cmd:.4f}"
+                                if math.isfinite(csv_left_cmd)
+                                else ""
+                            ),
+                            (
+                                f"{csv_right_cmd:.4f}"
+                                if math.isfinite(csv_right_cmd)
+                                else ""
+                            ),
+                            (
+                                f"{csv_left_actual:.4f}"
+                                if math.isfinite(csv_left_actual)
+                                else ""
+                            ),
+                            (
+                                f"{csv_right_actual:.4f}"
+                                if math.isfinite(csv_right_actual)
+                                else ""
+                            ),
+                            left_raw.sequence,
+                            right_raw.sequence,
+                            f"{left_arrival_s:.4f}",
+                            f"{right_arrival_s:.4f}",
+                            f"{pair_skew_ms:.4f}",
+                            (
+                                f"{cmd_age_ms:.4f}"
+                                if math.isfinite(cmd_age_ms)
+                                else ""
+                            ),
+                            (
+                                f"{actual_age_ms:.4f}"
+                                if math.isfinite(actual_age_ms)
+                                else ""
+                            ),
+                            csv_cmd_enabled,
+                        ]
+                    )
+                    rows += 1
 
                 # Print and plot are mutually exclusive.
                 if a.display == "print" and now >= next_print:
@@ -2087,7 +2369,8 @@ def main() -> None:
                         f"W={right_gyro:+7.2f}dps "
                         f"age={right_age * 1000:6.1f}ms [{rstate}] | "
                         f"PH={phase_deg:+7.2f}deg | "
-                        f"CMD={lcmd:+.3f}/{rcmd:+.3f} | "
+                        f"CMD={lcmd:+.3f}/{rcmd:+.3f} "
+                        f"TX={last_sent_left_nm:+.3f}/{last_sent_right_nm:+.3f} | "
                         f"ACT={actual_text} | "
                         f"T={teensy_stats.hz:5.1f}Hz | "
                         f"RSC={controller.cfg.rescaling:.1f} "
@@ -2146,12 +2429,27 @@ def main() -> None:
             1e-9,
         )
         csv_hz = rows / duration
+        control_hz = control_ticks / duration
+        teensy_tx_hz = teensy_tx_packets / duration
 
         print("=" * 104)
         print(f"CSV saved     : {csv_path}")
         print(
             f"CSV rows/rate : {rows} / {csv_hz:.2f} Hz "
+            f"(paired real IMU packets; nominal 100 Hz)"
+        )
+        print(
+            f"Control rate  : {control_ticks} / {control_hz:.2f} Hz "
             f"(target {a.rate:.1f} Hz)"
+        )
+        print(
+            f"Teensy TX rate: {teensy_tx_packets} / {teensy_tx_hz:.2f} Hz "
+            f"(target {a.teensy_tx_rate:.1f} Hz)"
+        )
+        print(
+            f"Pending drops : IMU L={left_imu.pending_drops}, "
+            f"R={right_imu.pending_drops}, "
+            f"TeensyFB={teensy.feedback_pending_drops}"
         )
         print(
             "Zero angle    : "

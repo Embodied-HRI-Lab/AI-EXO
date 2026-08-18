@@ -72,8 +72,8 @@ Dry-run with terminal:
 Dry-run with realtime plot:
     python NN_PC_Controller.py --display plot
 
-Select a packaged checkpoint:
-    python NN_PC_Controller.py --model models/flat_thigh_imu_tcn_balanced_4p2nm_100hz.pt
+Select any packaged checkpoint (MLP, GRU, or MoE):
+    python NN_PC_Controller.py --model models/slope_adam_lowtorque/uphill_direct_100hz.pt
 
 Real torque:
     python NN_PC_Controller.py --display plot --arm
@@ -97,9 +97,9 @@ import time
 from collections import deque
 
 try:
-    import msvcrt  # Windows console non-blocking keyboard input
+    import ctypes  # Windows global keyboard state (works even when plot has focus)
 except ImportError:
-    msvcrt = None
+    ctypes = None
 
 from dataclasses import dataclass
 from datetime import datetime
@@ -111,17 +111,6 @@ import serial
 import torch  
 from torch import nn   
 
-# Tiny per-frame networks are dramatically slower when PyTorch dispatches
-# their convolutions across a large desktop thread pool.  One CPU thread keeps
-# inference deterministic and comfortably inside the 10 ms control period.
-torch.set_num_threads(1)
-try:
-    torch.set_num_interop_threads(1)
-except RuntimeError:
-    # Another embedding may already have initialized the inter-op pool.  The
-    # intra-op setting above is the one that dominates this small TCN.
-    pass
-
 # =============================================================================
 # General configuration
 # =============================================================================
@@ -129,8 +118,8 @@ except RuntimeError:
 HEADER: Final[bytes] = b"\xA5\x5A"
 
 DEFAULT_LEFT_IMU_PORT = "COM8"
-DEFAULT_RIGHT_IMU_PORT = "COM6"
-DEFAULT_TEENSY_PORT = "COM7"
+DEFAULT_RIGHT_IMU_PORT = "COM9"
+DEFAULT_TEENSY_PORT = "COM10"
 DEFAULT_BAUD = 115200
 
 DEFAULT_CONTROL_HZ = 100.0
@@ -888,15 +877,9 @@ TorqueCommand = Tuple[float, float]
 # ============================================================
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-DEFAULT_MODEL_FILE = (
-    SCRIPT_DIR / "models" / "flat_thigh_imu_tcn_balanced_4p2nm_100hz.pt"
-)
 DEFAULT_MODEL_FILES = {
-    "direct": DEFAULT_MODEL_FILE,
-    # There is deliberately no packaged PD policy. Pointing both defaults at
-    # the one packaged checkpoint gives --policy pd a clear type-mismatch
-    # error instead of referring to a stale or missing model filename.
-    "pd": DEFAULT_MODEL_FILE,
+    "direct": SCRIPT_DIR / "models" / "flat22" / "direct_100hz.pt",
+    "pd": SCRIPT_DIR / "models" / "flat22" / "target_pd_100hz.pt",
 }
 
 
@@ -914,285 +897,6 @@ class PolicyMLP(nn.Module):
 
     def forward(self, value: torch.Tensor) -> torch.Tensor:
         return self.network(value)  
-
-
-class CausalConvBlock(nn.Module):
-    """One left-padded residual temporal-convolution block."""
-
-    def __init__(self, channels: int, kernel_size: int, dilation: int) -> None:
-        super().__init__()
-        self.left_padding = int(dilation) * (int(kernel_size) - 1)
-        self.conv = nn.Conv1d(
-            int(channels),
-            int(channels),
-            kernel_size=int(kernel_size),
-            dilation=int(dilation),
-        )
-        self.activation = nn.SiLU()
-
-    def forward(self, value: torch.Tensor) -> torch.Tensor:
-        padded = nn.functional.pad(value, (self.left_padding, 0))
-        return self.activation(self.conv(padded) + value)
-
-
-class CausalTCNExoPolicy(nn.Module):
-    """Thigh-IMU-history TCN with exact bilateral structure."""
-
-    def __init__(
-        self,
-        input_dim: int,
-        channels: int,
-        kernel_size: int,
-        dilations: Tuple[int, ...],
-        symmetric_average: bool,
-        antisymmetric_output: bool,
-    ) -> None:
-        super().__init__()
-        self.input_dim = int(input_dim)
-        self.symmetric_average = bool(symmetric_average)
-        self.antisymmetric_output = bool(antisymmetric_output)
-        if self.input_dim != 4:
-            raise ValueError("The packaged thigh-IMU TCN requires four inputs")
-        if not self.symmetric_average:
-            raise ValueError("The packaged TCN must use symmetric averaging")
-        if not self.antisymmetric_output:
-            raise ValueError("The packaged TCN must use bilateral antisymmetric output")
-        self.input_projection = nn.Conv1d(self.input_dim, int(channels), 1)
-        self.blocks = nn.ModuleList(
-            CausalConvBlock(int(channels), int(kernel_size), int(dilation))
-            for dilation in dilations
-        )
-        self.head = nn.Sequential(
-            nn.Linear(int(channels), int(channels)),
-            nn.SiLU(),
-            nn.Linear(int(channels), 2),
-        )
-
-    def _head_output(self, history: torch.Tensor) -> torch.Tensor:
-        features = self.input_projection(history.transpose(1, 2))
-        for block in self.blocks:
-            features = block(features)
-        return self.head(features[:, :, -1])
-
-    def forward(self, normalized_history: torch.Tensor) -> torch.Tensor:
-        if normalized_history.ndim != 3:
-            raise ValueError("TCN history must have shape [batch, time, 4]")
-        raw = self._head_output(normalized_history)
-        # Ordering is thigh angle R/L followed by angular velocity R/L.
-        # Evaluate the same
-        # network on the mirrored history, swap its outputs back, and average.
-        mirrored = normalized_history[..., [1, 0, 3, 2]]
-        mirrored_raw = self._head_output(mirrored)[..., [1, 0]]
-        raw = 0.5 * (raw + mirrored_raw)
-        difference = 0.5 * (raw[..., 0] - raw[..., 1])
-        return torch.tanh(torch.stack((difference, -difference), dim=-1))
-
-
-class _TCNTorqueInterface:
-    """100-Hz inference for the packaged thigh-IMU absolute-output TCN."""
-
-    def __init__(self, policy_type: str, model_path: Path) -> None:
-        self.policy_type = policy_type
-        self.model_path = model_path
-        self.model: Optional[CausalTCNExoPolicy] = None
-        self.backend = "causal_tcn_thigh_imu_history"
-        self.requires_torque_feedback = False
-        self.load_message = ""
-        self.last_error = ""
-        self.calls = 0
-        self.valid_outputs = 0
-        self.history_steps = 1
-        self.history: deque[np.ndarray] = deque()
-        self.previous_normalized = torch.zeros((1, 2), dtype=torch.float32)
-        self._load()
-
-    @property
-    def available(self) -> bool:
-        return self.model is not None
-
-    def _load(self) -> None:
-        try:
-            payload = torch.load(
-                self.model_path, map_location="cpu", weights_only=False
-            )
-            if payload.get("model_type") != "causal_tcn_exo":
-                raise ValueError("Checkpoint is not a causal_tcn_exo policy")
-            if self.policy_type != "direct":
-                raise ValueError("The packaged TCN is a Direct torque policy")
-            if float(payload.get("control_hz", -1.0)) != 100.0:
-                raise ValueError("TCN checkpoint is not explicitly marked 100 Hz")
-            if str(payload.get("exo_sensor_mode", "")) != "thigh_imu4":
-                raise ValueError("TCN checkpoint must use thigh_imu4 input")
-            if bool(payload.get("network_observes_exo_history", True)):
-                raise ValueError("TCN checkpoint must not observe Exo history")
-            if str(payload.get("output_mode", "")) != "absolute":
-                raise ValueError("TCN checkpoint must use absolute output")
-            if not bool(payload.get("symmetric_average", False)):
-                raise ValueError("TCN checkpoint must be left/right equivariant")
-            if not bool(payload.get("antisymmetric_output", False)):
-                raise ValueError("TCN checkpoint must output equal/opposite hip torque")
-
-            self.history_steps = int(payload["history_steps"])
-            self.sensor_dim = int(payload["proprio_dim"])
-            if self.history_steps != 64 or self.sensor_dim != 4:
-                raise ValueError(
-                    "Packaged TCN requires exactly 64 x thigh_imu4 history"
-                )
-            self.torque_scale_nm = float(payload["torque_scale_nm"])
-            self.max_delta = float(payload["max_delta"])
-            expected_delta_nm = self.torque_scale_nm * self.max_delta
-            recorded_delta_nm = float(
-                payload.get("max_delta_nm_per_step", expected_delta_nm)
-            )
-            if not math.isclose(
-                expected_delta_nm, recorded_delta_nm, rel_tol=0.0, abs_tol=1.0e-6
-            ):
-                raise ValueError("TCN torque scale and slew metadata disagree")
-            if not (0.0 < self.torque_scale_nm <= 5.0):
-                raise ValueError("TCN nominal torque must fit the +/-5 Nm PC limit")
-
-            self.mean = torch.as_tensor(
-                payload["proprio_mean"], dtype=torch.float32
-            ).reshape(1, 1, self.sensor_dim)
-            self.std = torch.as_tensor(
-                payload["proprio_std"], dtype=torch.float32
-            ).reshape(1, 1, self.sensor_dim).clamp_min(1.0e-4)
-            gate = payload.get("standstill_gate", {})
-            if not bool(gate.get("enabled", False)):
-                raise ValueError("Packaged hardware TCN requires a standstill gate")
-            self.standstill_angle_rad = float(gate["max_abs_angle_rad"])
-            self.standstill_velocity_rad_s = float(
-                gate["max_abs_velocity_rad_s"]
-            )
-            if self.standstill_angle_rad <= 0.0:
-                raise ValueError("standstill angle threshold must be positive")
-            if self.standstill_velocity_rad_s <= 0.0:
-                raise ValueError("standstill velocity threshold must be positive")
-
-            model = CausalTCNExoPolicy(
-                input_dim=self.sensor_dim,
-                channels=int(payload["channels"]),
-                kernel_size=int(payload["kernel_size"]),
-                dilations=tuple(int(value) for value in payload["dilations"]),
-                symmetric_average=True,
-                antisymmetric_output=True,
-            )
-            model.load_state_dict(payload["tcn_exo_state_dict"], strict=True)
-            model.eval()
-            self.model = model
-        except Exception as exc:
-            self.load_message = (
-                f"Failed to load thigh-IMU TCN '{self.model_path}': {exc}. "
-                "The controller will output zero torque."
-            )
-            self.model = None
-            return
-
-        self.load_message = (
-            f"Loaded symmetric thigh-IMU TCN: {self.model_path} | "
-            f"nominal +/-{self.torque_scale_nm:.2f} Nm | "
-            f"slew {self.torque_scale_nm * self.max_delta:.3f} Nm/frame"
-        )
-
-    def reset(self) -> None:
-        self.history.clear()
-        self.previous_normalized.zero_()
-
-    def _append_history(self, frame: np.ndarray) -> torch.Tensor:
-        if not self.history:
-            for _ in range(self.history_steps):
-                self.history.append(frame.copy())
-        else:
-            self.history.append(frame.copy())
-            while len(self.history) > self.history_steps:
-                self.history.popleft()
-        return torch.from_numpy(np.stack(self.history))[None]
-
-    def _is_standing(self, history: torch.Tensor) -> bool:
-        max_angle = float(torch.max(torch.abs(history[..., :2])).item())
-        max_velocity = float(torch.max(torch.abs(history[..., 2:])).item())
-        return (
-            max_angle <= self.standstill_angle_rad
-            and max_velocity <= self.standstill_velocity_rad_s
-        )
-
-    def zero_state_test(self, steps: int = 40) -> Optional[TorqueCommand]:
-        old_calls = self.calls
-        old_valid_outputs = self.valid_outputs
-        old_error = self.last_error
-        self.reset()
-        result: Optional[TorqueCommand] = None
-        for _ in range(max(int(steps), self.history_steps, 1)):
-            result = self.get_torque((0.0, 0.0, 0.0, 0.0, 0.0, 0.0))
-            if result is None:
-                break
-        self.reset()
-        self.calls = old_calls
-        self.valid_outputs = old_valid_outputs
-        test_error = self.last_error
-        self.last_error = old_error
-        if result is None and test_error:
-            print(f"[NN ZERO TEST ERROR] {test_error}")
-        return result
-
-    def get_torque(self, observation: Observation) -> Optional[TorqueCommand]:
-        if self.model is None:
-            return None
-        self.calls += 1
-        try:
-            (
-                _left_actual_nm,
-                _right_actual_nm,
-                left_angle,
-                left_velocity,
-                right_angle,
-                right_velocity,
-            ) = observation
-            frame = np.asarray(
-                [right_angle, left_angle, right_velocity, left_velocity],
-                dtype=np.float32,
-            )
-            history = self._append_history(frame)
-            if self._is_standing(history):
-                # Ramp an already-active command back to zero instead of
-                # bypassing the physical slew limit when walking stops.
-                action = self.previous_normalized + torch.clamp(
-                    -self.previous_normalized,
-                    -self.max_delta,
-                    self.max_delta,
-                )
-                self.previous_normalized = action.detach()
-                right_left = (
-                    action[0].numpy() * self.torque_scale_nm
-                ).astype(np.float32)
-            else:
-                normalized = (history - self.mean) / self.std
-                with torch.inference_mode():
-                    target = self.model(normalized)
-                    action = torch.clamp(
-                        self.previous_normalized
-                        + torch.clamp(
-                            target - self.previous_normalized,
-                            -self.max_delta,
-                            self.max_delta,
-                        ),
-                        -1.0,
-                        1.0,
-                    )
-                self.previous_normalized = action.detach()
-                right_left = (
-                    action[0].numpy() * self.torque_scale_nm
-                ).astype(np.float32)
-            result = (float(right_left[1]), float(right_left[0]))
-            if not all(math.isfinite(value) for value in result):
-                raise ValueError("Output contains NaN or Inf")
-        except Exception as exc:
-            self.last_error = f"{type(exc).__name__}: {exc}"
-            return None
-
-        self.last_error = ""
-        self.valid_outputs += 1
-        return result
 
 
 class _FlatMLPTorqueInterface:
@@ -1232,20 +936,6 @@ class _FlatMLPTorqueInterface:
             )
             self.torque_scale_nm = float(payload.get("torque_scale_nm", 10.0))
             self.max_delta_nm = float(payload["max_delta_nm_per_step"])
-            self.per_frame_input_dim = int(
-                payload.get(
-                    "per_frame_input_dim",
-                    len(self.input_mean) // self.history_steps,
-                )
-            )
-            if self.per_frame_input_dim not in (4, 6):
-                raise ValueError(
-                    "Flat Direct input must contain four hip kinematics, "
-                    "optionally followed by two normalized Exo torques"
-                )
-            if len(self.input_mean) != self.history_steps * self.per_frame_input_dim:
-                raise ValueError("Flat policy input metadata has inconsistent dimensions")
-            self.requires_torque_feedback = self.per_frame_input_dim == 6
             output_dim = 2 if self.policy_type == "direct" else 1
             self.model = PolicyMLP(
                 len(self.input_mean), int(payload["hidden_dim"]), output_dim
@@ -1341,13 +1031,7 @@ class _FlatMLPTorqueInterface:
         # zeroed IMU readings with math.radians() before calling get_torque().
 
         if self.policy_type == "direct":
-            frame = hip4
-            if self.per_frame_input_dim == 6:
-                actual_normalized = np.asarray(
-                    [right_actual_nm, left_actual_nm], dtype=np.float32
-                ) / self.torque_scale_nm
-                frame = np.concatenate((hip4, actual_normalized))
-            history = self._append_history(frame)
+            history = self._append_history(hip4)
             features = history.reshape(-1)
             normalized = torch.from_numpy(
                 (features - self.input_mean) / self.input_std
@@ -1690,10 +1374,7 @@ class NeuralTorqueInterface:
         try:
             payload = torch.load(path, map_location="cpu", weights_only=False)
             self.model_type = str(payload.get("model_type", ""))
-            if self.model_type == "causal_tcn_exo":
-                inferred = "direct"
-                interface_type = _TCNTorqueInterface
-            elif self.model_type == "recurrent_exo":
+            if self.model_type == "recurrent_exo":
                 inferred = "direct"
                 interface_type = _RecurrentTorqueInterface
             elif self.model_type == "recurrent_exo_target_pd":
@@ -1994,31 +1675,63 @@ class PlotSubprocess:
 # Runtime keyboard control
 # =============================================================================
 
+# Windows virtual-key codes. GetAsyncKeyState() is used instead of msvcrt so
+# Up/Down still work when the matplotlib plot window has keyboard focus.
+VK_UP = 0x26
+VK_DOWN = 0x28
+
+_prev_up_pressed = False
+_prev_down_pressed = False
+
+
 def poll_torque_scale_keys(
     current_scale: float,
     step: float,
 ) -> Tuple[float, bool]:
-    """Read Windows Up/Down keys without blocking the 100-Hz loop."""
-    if msvcrt is None:
+    """
+    Read Windows Up/Down keys globally without blocking the 100-Hz loop.
+
+    A rising-edge detector is used so one physical key press changes the
+    assistance scale exactly once, even though this function is polled at
+    100 Hz. The plot window may have focus.
+
+        Up   -> scale + step
+        Down -> scale - step
+    """
+    global _prev_up_pressed, _prev_down_pressed
+
+    if ctypes is None or sys.platform != "win32":
+        return current_scale, False
+
+    try:
+        user32 = ctypes.windll.user32
+        up_pressed = bool(user32.GetAsyncKeyState(VK_UP) & 0x8000)
+        down_pressed = bool(user32.GetAsyncKeyState(VK_DOWN) & 0x8000)
+    except Exception:
+        # Keyboard control is optional; never let it disturb the control loop.
         return current_scale, False
 
     updated = float(current_scale)
     changed = False
-    while msvcrt.kbhit():
-        key = msvcrt.getwch()
-        if key not in ("\x00", "\xe0") or not msvcrt.kbhit():
-            continue
-        code = msvcrt.getwch()
-        if code == "H":
-            new_scale = min(MAX_TORQUE_SCALE, updated + step)
-        elif code == "P":
-            new_scale = max(MIN_TORQUE_SCALE, updated - step)
-        else:
-            continue
+
+    # Rising edge only. Holding a key does not repeatedly change scale.
+    if up_pressed and not _prev_up_pressed:
+        new_scale = min(MAX_TORQUE_SCALE, updated + step)
         new_scale = round(new_scale, 4)
         if abs(new_scale - updated) > 1.0e-12:
             updated = new_scale
             changed = True
+
+    if down_pressed and not _prev_down_pressed:
+        new_scale = max(MIN_TORQUE_SCALE, updated - step)
+        new_scale = round(new_scale, 4)
+        if abs(new_scale - updated) > 1.0e-12:
+            updated = new_scale
+            changed = True
+
+    _prev_up_pressed = up_pressed
+    _prev_down_pressed = down_pressed
+
     return updated, changed
 
 
@@ -2145,7 +1858,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--max-torque",
         type=float,
-        default=5.0,
+        default=8.0,
         help="PC NN torque clamp in Nm; current Teensy input limit is +/-5 Nm",
     )
     p.add_argument(
@@ -2206,9 +1919,9 @@ def validate_args(a: argparse.Namespace) -> None:
     if a.torque_scale_step <= 0:
         raise ValueError("--torque-scale-step must be positive")
 
-    if a.max_torque <= 0 or a.max_torque > 5.0:
+    if a.max_torque <= 0 or a.max_torque > 10.0:
         raise ValueError(
-            "--max-torque must be in (0, 5] to match the current Teensy."
+            "--max-torque must be in (0, 10] to match the current Teensy."
         )
 
 
@@ -2330,7 +2043,7 @@ def main() -> None:
         f"(range {MIN_TORQUE_SCALE:.1f}-{MAX_TORQUE_SCALE:.1f}, "
         f"step {a.torque_scale_step:.1f})"
     )
-    print("Keys      : Up = scale +step | Down = scale -step")
+    print("Keys      : Up = scale +step | Down = scale -step | global Windows hotkeys")
     print(f"PC clamp  : +/-{a.max_torque:.3f} Nm")
     print(f"Output    : {'ARMED' if a.arm else 'DRY RUN - zero torque sent'}")
     print(f"CSV       : {csv_path}")
@@ -2639,8 +2352,8 @@ def main() -> None:
                             rcmd = 0.0
                             policy.reset()
                         else:
-                            scaled_left_nm = neural_output[0] * torque_scale
-                            scaled_right_nm = neural_output[1] * torque_scale
+                            scaled_left_nm = -neural_output[0] * torque_scale
+                            scaled_right_nm = -neural_output[1] * torque_scale
                             lcmd = max(
                                 -a.max_torque,
                                 min(a.max_torque, scaled_left_nm),
