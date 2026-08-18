@@ -252,3 +252,34 @@ injury or equipment damage.
 
 AI-EXO is research software intended for controlled laboratory development. It
 is not a medical device and is not validated for clinical or unsupervised use.
+
+## Hip Exoskeleton GUI & Voice Control System
+
+A Python-based Graphical User Interface (GUI) and voice interaction system for real-time telemetry monitoring and AI voice control of a hip exoskeleton.
+
+### Environment & Dependencies
+
+* **Python Version:** Python 3.8+
+* **Required Libraries:** Install all necessary dependencies using `pip`:
+
+`pip install PyQt5 pyqtgraph pyserial pygame SpeechRecognition dashscope`
+
+* **API Key Configuration:** Set your Alibaba DashScope API key in `gui_app.py`:
+
+`DASHSCOPE_API_KEY = "your_dashscope_api_key_here"`
+
+### How to Run
+
+1. Connect the exoskeleton hardware to your PC via USB.
+2. Launch the application: `python gui_app.py`
+3. Select the correct serial port from the **ComPort** dropdown menu and click **Connect**.
+4. Click the **Voice Ctrl: OFF** button to toggle voice interaction ON/OFF.
+
+### Voice Control Commands
+
+| Action | Supported Natural Voice Commands (Examples) |
+| :--- | :--- |
+| **Wake-up / Activate** | `"开始测试"` / `"测试"` |
+| **Set Stiffness (K)** | `"把k设为 1.5"` / `"开设为 1.5"` |
+| **Set Delay (Delay)** | `"delay设置为 200"` / `"带类设为 200"` |
+| **Deactivate / Sleep** | `"退出测试"` / `"停止测试"` |
