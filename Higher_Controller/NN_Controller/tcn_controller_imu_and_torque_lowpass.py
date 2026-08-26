@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import math
 import queue
 import struct
@@ -56,6 +57,8 @@ DEFAULT_STALE_WARNING_S = 0.050
 DEFAULT_IMU_TIMEOUT_S = 0.150
 DEFAULT_TEENSY_TIMEOUT_S = 0.200
 DEFAULT_MODEL_PATH = Path(__file__).resolve().with_name("steady_unique_100hz_20260824_124007_100hz_deploy.pt")
+SCRIPTED_METADATA_FILE = "deployment.json"
+SCRIPTED_DEPLOYMENT_FORMAT = "scripted_tcn_policy_v1"
 
 CMD_TORQUE = 0x54
 CMD_STOP = 0x50
@@ -258,11 +261,175 @@ class UnifiedTCNPolicy:
         print(f"NORMALIZATION: {self.normalization_scheme}")
         print(f"TORQUE COMMAND SCALE: {self.torque_scale_nm:g} Nm")
         print(f"MODEL PARAMETERS: {arch.get('parameter_count', 'unknown')}")
-        print("HISTORY STARTUP: zero assistance until 100 samples")
+        print(f"HISTORY STARTUP: zero assistance until {self.history_steps} samples")
         print(f"MODEL CHECKPOINT: {self.model_path}")
         print(f"LEFT_IMU_DIRECTION and RIGHT_IMU_DIRECTION are CLI-configurable; forward thigh flexion must be positive.")
         print(f"SAFETY METADATA: {safety}")
         print("=" * 108)
+
+
+class ScriptedTCNPolicy:
+    """Runtime adapter for the validated stateful LZN thigh-IMU policy."""
+
+    def __init__(
+        self,
+        model_path: Path,
+        model: torch.jit.ScriptModule,
+        metadata: dict[str, object],
+        *,
+        device: str = "cpu",
+    ) -> None:
+        self.model_path = model_path.expanduser().resolve()
+        self.device = torch.device(device)
+        self.model = model.to(self.device).eval()
+        self.metadata = metadata
+        if metadata.get("deployment_format") != SCRIPTED_DEPLOYMENT_FORMAT:
+            raise ValueError("unsupported scripted TCN deployment format")
+        if int(metadata.get("control_hz", -1)) != 100:
+            raise ValueError("scripted TCN deployment is not marked 100 Hz")
+        if metadata.get("history_startup") != "repeat_first_valid_frame":
+            raise ValueError("unsupported scripted TCN history startup mode")
+        expected_inputs = [
+            "left_thigh_angle_rad",
+            "left_thigh_velocity_rad_s",
+            "right_thigh_angle_rad",
+            "right_thigh_velocity_rad_s",
+        ]
+        if metadata.get("input_channel_names") != expected_inputs:
+            raise ValueError("scripted TCN input order does not match the controller")
+        if not hasattr(self.model, "reset"):
+            raise ValueError("scripted TCN deployment does not expose reset()")
+
+        self.history_steps = int(metadata["history_steps"])
+        self.sensor_hz = int(metadata["control_hz"])
+        self.control_hz = self.sensor_hz
+        self.input_channel_names = expected_inputs
+        self.torque_scale_nm = float(metadata["torque_scale_nm"])
+        self.mandatory_delta_nm = float(metadata["max_delta_nm_per_step"])
+        if not 0.0 < self.torque_scale_nm <= 12.0:
+            raise ValueError("scripted TCN torque scale must be in (0, 12] Nm")
+        if not 0.0 < self.mandatory_delta_nm <= self.torque_scale_nm:
+            raise ValueError("scripted TCN slew metadata is invalid")
+
+        self.latest_frame: np.ndarray | None = None
+        self.calls = 0
+        self.valid_outputs = 0
+        self.last_error = ""
+        self.last_inference_time_ms = math.nan
+        self.model.reset()
+
+    @property
+    def history_ready(self) -> bool:
+        # The scripted deployment repeats its first valid frame internally to
+        # initialize the complete history, matching its validated PC runtime.
+        return self.latest_frame is not None
+
+    def reset(self) -> None:
+        self.latest_frame = None
+        self.model.reset()
+        self.last_inference_time_ms = math.nan
+
+    def append_frame(
+        self,
+        left_angle_rad: float,
+        left_velocity_rad_s: float,
+        right_angle_rad: float,
+        right_velocity_rad_s: float,
+    ) -> None:
+        self.latest_frame = np.asarray(
+            [
+                left_angle_rad,
+                left_velocity_rad_s,
+                right_angle_rad,
+                right_velocity_rad_s,
+            ],
+            dtype=np.float32,
+        )
+
+    def infer(self) -> tuple[np.ndarray, np.ndarray] | None:
+        if not self.history_ready:
+            return None
+        self.calls += 1
+        try:
+            frame = torch.from_numpy(self.latest_frame).to(self.device)
+            start = time.perf_counter()
+            with torch.inference_mode():
+                command = self.model(frame, self.mandatory_delta_nm)
+            self.last_inference_time_ms = (time.perf_counter() - start) * 1000.0
+            command_nm = command.detach().cpu().numpy().astype(np.float32)
+            if command_nm.shape != (2,) or not np.all(np.isfinite(command_nm)):
+                raise ValueError("scripted TCN output must be two finite torque values")
+            if np.any(np.abs(command_nm) > self.torque_scale_nm + 1.0e-5):
+                raise ValueError("scripted TCN output exceeds its torque scale")
+            action = command_nm / np.float32(self.torque_scale_nm)
+            self.valid_outputs += 1
+            self.last_error = ""
+            return action.astype(np.float32), command_nm
+        except Exception as exc:
+            self.last_error = f"{type(exc).__name__}: {exc}"
+            self.latest_frame = None
+            self.model.reset()
+            return None
+
+    def print_startup_summary(self) -> None:
+        print("=" * 108)
+        print("MODEL: validated stateful scripted thigh-IMU TCN")
+        print(f"CONTROL: {self.control_hz} Hz")
+        print(
+            f"HISTORY: {self.history_steps} samples / "
+            f"{self.history_steps / self.sensor_hz:.2f} s (inside model)"
+        )
+        print(f"INPUT ORDER: {self.input_channel_names}")
+        print(f"TORQUE COMMAND SCALE: +/-{self.torque_scale_nm:g} Nm")
+        print(f"MANDATORY MODEL SLEW: {self.mandatory_delta_nm:.3f} Nm/frame")
+        print("HISTORY STARTUP: first valid frame is repeated inside the model")
+        print(f"STANDSTILL GATE: {self.metadata.get('standstill_gate', {})}")
+        print(f"MODEL CHECKPOINT: {self.model_path}")
+        print("=" * 108)
+
+
+def load_tcn_policy(
+    model_path: Path,
+    *,
+    device: str = "cpu",
+) -> UnifiedTCNPolicy | ScriptedTCNPolicy:
+    """Load either the raw Unified checkpoint or validated LZN TorchScript."""
+
+    resolved = model_path.expanduser().resolve()
+    if not resolved.is_file():
+        raise FileNotFoundError(f"model checkpoint not found: {resolved}")
+
+    extra_files: dict[str, str | bytes] = {SCRIPTED_METADATA_FILE: ""}
+    try:
+        scripted = torch.jit.load(
+            str(resolved), map_location=device, _extra_files=extra_files
+        )
+    except RuntimeError:
+        scripted = None
+    if scripted is not None:
+        raw_metadata = extra_files[SCRIPTED_METADATA_FILE]
+        if isinstance(raw_metadata, bytes):
+            raw_metadata = raw_metadata.decode("utf-8")
+        if not raw_metadata:
+            raise ValueError("scripted checkpoint is missing deployment metadata")
+        metadata = json.loads(raw_metadata)
+        if not isinstance(metadata, dict):
+            raise ValueError("scripted checkpoint deployment metadata must be an object")
+        return ScriptedTCNPolicy(
+            resolved,
+            scripted,
+            metadata,
+            device=device,
+        )
+
+    payload = torch.load(resolved, map_location="cpu", weights_only=False)
+    if not isinstance(payload, dict) or payload.get("model_type") != "causal_tcn":
+        model_type = payload.get("model_type") if isinstance(payload, dict) else None
+        raise ValueError(
+            f"unsupported checkpoint model_type={model_type or 'missing'!r}: "
+            f"{resolved}"
+        )
+    return UnifiedTCNPolicy(resolved, device=device)
 
 
 class ImuParser:
@@ -817,7 +984,7 @@ def main() -> None:
     a = build_parser().parse_args()
     validate_args(a)
     torch.set_num_threads(1)
-    policy = UnifiedTCNPolicy(a.model)
+    policy = load_tcn_policy(a.model)
     imu_filter = ImuInputLowPass(cutoff_hz=a.imu_cutoff_hz, sample_hz=a.rate, enabled=not a.no_imu_filter)
     torque_filter = TorqueCommandFilter(
         cutoff_hz=a.output_cutoff_hz,
