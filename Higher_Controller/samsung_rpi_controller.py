@@ -71,8 +71,8 @@ import serial
 
 HEADER: Final[bytes] = b"\xA5\x5A"
 
-DEFAULT_LEFT_IMU_PORT = "/dev/ttyUSB0"
-DEFAULT_RIGHT_IMU_PORT = "/dev/ttyUSB1"
+DEFAULT_LEFT_IMU_PORT = "/dev/ttyUSB1"
+DEFAULT_RIGHT_IMU_PORT = "/dev/ttyUSB0"
 DEFAULT_TEENSY_PORT = "/dev/serial0"
 DEFAULT_BAUD = 115200
 
