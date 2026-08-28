@@ -1,0 +1,279 @@
+{
+  "schema": "current_slope_thigh_imu_cross_rate_validation_v1",
+  "source_hz": 30,
+  "runtime_hz": 100,
+  "input_filter_cutoff_hz": 10,
+  "history_timebase_preserved": true,
+  "rows": {
+    "rampdown_activation2": {
+      "source_model": "/home/jimmylab/lzn/myo-exo/results/20260827_slope_thighimu_deployment_candidates_30hz/rampdown_activation2/rampdown_activation2_thighimu_h8_30hz.pt",
+      "package": "/home/jimmylab/lzn/AI-EXO/Higher_Controller/NN_Controller/models/slope_thigh_imu_20260827/rampdown_activation2_thighimu_30hz_at_100hz_lzn.pt",
+      "held_out_trajectory": "/home/jimmylab/lzn/myo-exo/results/20260826_rampdown_direct_objective_solver_30hz/human_trajectories/trajectories/trajectory_07.npz",
+      "frames": 160,
+      "frame_range": [
+        20,
+        179
+      ],
+      "source_30hz_vs_teacher": {
+        "rmse_nm": 0.38022491335868835,
+        "mae_nm": 0.2321917563676834,
+        "p95_abs_nm": 0.9908754825592041,
+        "max_abs_nm": 1.4952017068862915,
+        "per_side_rmse_nm": {
+          "right": 0.334183931350708,
+          "left": 0.4212636351585388
+        }
+      },
+      "packaged_100hz_vs_teacher": {
+        "rmse_nm": 0.37820932269096375,
+        "mae_nm": 0.23189227283000946,
+        "p95_abs_nm": 0.8937005400657654,
+        "max_abs_nm": 1.8865329027175903,
+        "per_side_rmse_nm": {
+          "right": 0.3226342499256134,
+          "left": 0.42660483717918396
+        }
+      },
+      "cross_rate_packaged_vs_source_30hz": {
+        "rmse_nm": 0.09779007732868195,
+        "mae_nm": 0.052893273532390594,
+        "p95_abs_nm": 0.21508057415485382,
+        "max_abs_nm": 0.6298836469650269,
+        "per_side_rmse_nm": {
+          "right": 0.09072786569595337,
+          "left": 0.10437553375959396
+        }
+      },
+      "packaged_peak_abs_nm": 2.0998287200927734,
+      "packaged_sampled_30hz_max_slew_nm": 0.8400001525878906,
+      "packaged_sampled_interval_max_ticks": 4,
+      "packaged_sampled_interval_allowed_slew_nm": 0.8400099999999999,
+      "package_runtime_max_slew_nm_per_100hz_step": 0.21
+    },
+    "rampdown_impact_t081920": {
+      "source_model": "/home/jimmylab/lzn/myo-exo/results/20260827_slope_thighimu_deployment_candidates_30hz/rampdown_impact_t081920/rampdown_impact_t081920_thighimu_h8_30hz.pt",
+      "package": "/home/jimmylab/lzn/AI-EXO/Higher_Controller/NN_Controller/models/slope_thigh_imu_20260827/rampdown_impact_t081920_thighimu_30hz_at_100hz_lzn.pt",
+      "held_out_trajectory": "/home/jimmylab/lzn/myo-exo/results/20260826_rampdown_direct_objective_solver_30hz/human_trajectories/trajectories/trajectory_07.npz",
+      "frames": 160,
+      "frame_range": [
+        20,
+        179
+      ],
+      "source_30hz_vs_teacher": {
+        "rmse_nm": 0.36506733298301697,
+        "mae_nm": 0.22977106273174286,
+        "p95_abs_nm": 0.7521964311599731,
+        "max_abs_nm": 2.019845962524414,
+        "per_side_rmse_nm": {
+          "right": 0.32442373037338257,
+          "left": 0.401618629693985
+        }
+      },
+      "packaged_100hz_vs_teacher": {
+        "rmse_nm": 0.37088435888290405,
+        "mae_nm": 0.23580753803253174,
+        "p95_abs_nm": 0.800885796546936,
+        "max_abs_nm": 2.0261082649230957,
+        "per_side_rmse_nm": {
+          "right": 0.329657644033432,
+          "left": 0.4079660177230835
+        }
+      },
+      "cross_rate_packaged_vs_source_30hz": {
+        "rmse_nm": 0.09118278324604034,
+        "mae_nm": 0.04995919391512871,
+        "p95_abs_nm": 0.19378554821014404,
+        "max_abs_nm": 0.5703443884849548,
+        "per_side_rmse_nm": {
+          "right": 0.08555745333433151,
+          "left": 0.09648068249225616
+        }
+      },
+      "packaged_peak_abs_nm": 2.0991787910461426,
+      "packaged_sampled_30hz_max_slew_nm": 0.8400000929832458,
+      "packaged_sampled_interval_max_ticks": 4,
+      "packaged_sampled_interval_allowed_slew_nm": 0.8400099999999999,
+      "package_runtime_max_slew_nm_per_100hz_step": 0.21
+    },
+    "rampdown_weighted_activation2": {
+      "source_model": "/home/jimmylab/lzn/myo-exo/results/20260827_slope_thighimu_deployment_candidates_30hz/rampdown_weighted_activation2/rampdown_weighted_activation2_thighimu_h8_30hz.pt",
+      "package": "/home/jimmylab/lzn/AI-EXO/Higher_Controller/NN_Controller/models/slope_thigh_imu_20260827/rampdown_weighted_activation2_thighimu_30hz_at_100hz_lzn.pt",
+      "held_out_trajectory": "/home/jimmylab/lzn/myo-exo/results/20260826_rampdown_direct_objective_solver_30hz/human_trajectories/trajectories/trajectory_07.npz",
+      "frames": 160,
+      "frame_range": [
+        20,
+        179
+      ],
+      "source_30hz_vs_teacher": {
+        "rmse_nm": 0.4572071135044098,
+        "mae_nm": 0.2937096655368805,
+        "p95_abs_nm": 0.9623715281486511,
+        "max_abs_nm": 2.110583782196045,
+        "per_side_rmse_nm": {
+          "right": 0.39801377058029175,
+          "left": 0.5095701217651367
+        }
+      },
+      "packaged_100hz_vs_teacher": {
+        "rmse_nm": 0.4694083631038666,
+        "mae_nm": 0.30537495017051697,
+        "p95_abs_nm": 0.9949122071266174,
+        "max_abs_nm": 2.11694073677063,
+        "per_side_rmse_nm": {
+          "right": 0.40989693999290466,
+          "left": 0.5221809148788452
+        }
+      },
+      "cross_rate_packaged_vs_source_30hz": {
+        "rmse_nm": 0.08599551767110825,
+        "mae_nm": 0.057261429727077484,
+        "p95_abs_nm": 0.19569435715675354,
+        "max_abs_nm": 0.29597821831703186,
+        "per_side_rmse_nm": {
+          "right": 0.08218524605035782,
+          "left": 0.08964399248361588
+        }
+      },
+      "packaged_peak_abs_nm": 2.0969045162200928,
+      "packaged_sampled_30hz_max_slew_nm": 0.8400000929832458,
+      "packaged_sampled_interval_max_ticks": 4,
+      "packaged_sampled_interval_allowed_slew_nm": 0.8400099999999999,
+      "package_runtime_max_slew_nm_per_100hz_step": 0.21
+    },
+    "rampup_activation2": {
+      "source_model": "/home/jimmylab/lzn/myo-exo/results/20260827_slope_thighimu_deployment_candidates_30hz/rampup_activation2/rampup_activation2_thighimu_h8_30hz.pt",
+      "package": "/home/jimmylab/lzn/AI-EXO/Higher_Controller/NN_Controller/models/slope_thigh_imu_20260827/rampup_activation2_thighimu_30hz_at_100hz_lzn.pt",
+      "held_out_trajectory": "/home/jimmylab/lzn/myo-exo/results/202608261325_rampup_fixedhuman_exo_teacher_30hz/human_trajectories/trajectories/trajectory_07.npz",
+      "frames": 160,
+      "frame_range": [
+        20,
+        179
+      ],
+      "source_30hz_vs_teacher": {
+        "rmse_nm": 0.4222753942012787,
+        "mae_nm": 0.24989137053489685,
+        "p95_abs_nm": 0.758262574672699,
+        "max_abs_nm": 2.5175178050994873,
+        "per_side_rmse_nm": {
+          "right": 0.34148529171943665,
+          "left": 0.48991918563842773
+        }
+      },
+      "packaged_100hz_vs_teacher": {
+        "rmse_nm": 0.47364917397499084,
+        "mae_nm": 0.31072500348091125,
+        "p95_abs_nm": 0.9280858039855957,
+        "max_abs_nm": 2.5383052825927734,
+        "per_side_rmse_nm": {
+          "right": 0.39093565940856934,
+          "left": 0.5439267754554749
+        }
+      },
+      "cross_rate_packaged_vs_source_30hz": {
+        "rmse_nm": 0.15097852051258087,
+        "mae_nm": 0.10736358165740967,
+        "p95_abs_nm": 0.29427045583724976,
+        "max_abs_nm": 0.6188565492630005,
+        "per_side_rmse_nm": {
+          "right": 0.16709764301776886,
+          "left": 0.1329188048839569
+        }
+      },
+      "packaged_peak_abs_nm": 4.159285545349121,
+      "packaged_sampled_30hz_max_slew_nm": 0.8400002717971802,
+      "packaged_sampled_interval_max_ticks": 4,
+      "packaged_sampled_interval_allowed_slew_nm": 0.8400099999999999,
+      "package_runtime_max_slew_nm_per_100hz_step": 0.21
+    },
+    "rampup_impact_activation2_init": {
+      "source_model": "/home/jimmylab/lzn/myo-exo/results/20260827_slope_thighimu_deployment_candidates_30hz/rampup_impact_activation2_init/rampup_impact_activation2_init_thighimu_h8_30hz.pt",
+      "package": "/home/jimmylab/lzn/AI-EXO/Higher_Controller/NN_Controller/models/slope_thigh_imu_20260827/rampup_impact_activation2_init_thighimu_30hz_at_100hz_lzn.pt",
+      "held_out_trajectory": "/home/jimmylab/lzn/myo-exo/results/202608261325_rampup_fixedhuman_exo_teacher_30hz/human_trajectories/trajectories/trajectory_07.npz",
+      "frames": 160,
+      "frame_range": [
+        20,
+        179
+      ],
+      "source_30hz_vs_teacher": {
+        "rmse_nm": 0.5428439378738403,
+        "mae_nm": 0.37038034200668335,
+        "p95_abs_nm": 1.2912813425064087,
+        "max_abs_nm": 2.4919910430908203,
+        "per_side_rmse_nm": {
+          "right": 0.3839447498321533,
+          "left": 0.6647897958755493
+        }
+      },
+      "packaged_100hz_vs_teacher": {
+        "rmse_nm": 0.5664597749710083,
+        "mae_nm": 0.38711392879486084,
+        "p95_abs_nm": 1.3568580150604248,
+        "max_abs_nm": 2.4116225242614746,
+        "per_side_rmse_nm": {
+          "right": 0.4058453440666199,
+          "left": 0.6906828880310059
+        }
+      },
+      "cross_rate_packaged_vs_source_30hz": {
+        "rmse_nm": 0.09945733845233917,
+        "mae_nm": 0.07499933242797852,
+        "p95_abs_nm": 0.20557677745819092,
+        "max_abs_nm": 0.2203688621520996,
+        "per_side_rmse_nm": {
+          "right": 0.10480433702468872,
+          "left": 0.09380604326725006
+        }
+      },
+      "packaged_peak_abs_nm": 4.125095844268799,
+      "packaged_sampled_30hz_max_slew_nm": 0.8400002717971802,
+      "packaged_sampled_interval_max_ticks": 4,
+      "packaged_sampled_interval_allowed_slew_nm": 0.8400099999999999,
+      "package_runtime_max_slew_nm_per_100hz_step": 0.21
+    },
+    "rampup_weighted_activation2": {
+      "source_model": "/home/jimmylab/lzn/myo-exo/results/20260827_slope_thighimu_deployment_candidates_30hz/rampup_weighted_activation2/rampup_weighted_activation2_thighimu_h8_30hz.pt",
+      "package": "/home/jimmylab/lzn/AI-EXO/Higher_Controller/NN_Controller/models/slope_thigh_imu_20260827/rampup_weighted_activation2_thighimu_30hz_at_100hz_lzn.pt",
+      "held_out_trajectory": "/home/jimmylab/lzn/myo-exo/results/202608261325_rampup_fixedhuman_exo_teacher_30hz/human_trajectories/trajectories/trajectory_07.npz",
+      "frames": 160,
+      "frame_range": [
+        20,
+        179
+      ],
+      "source_30hz_vs_teacher": {
+        "rmse_nm": 0.37395724654197693,
+        "mae_nm": 0.28672754764556885,
+        "p95_abs_nm": 0.7062193751335144,
+        "max_abs_nm": 1.5693585872650146,
+        "per_side_rmse_nm": {
+          "right": 0.3636655807495117,
+          "left": 0.38397321105003357
+        }
+      },
+      "packaged_100hz_vs_teacher": {
+        "rmse_nm": 0.42015767097473145,
+        "mae_nm": 0.32211488485336304,
+        "p95_abs_nm": 0.8036486506462097,
+        "max_abs_nm": 1.5083162784576416,
+        "per_side_rmse_nm": {
+          "right": 0.4047689437866211,
+          "left": 0.43500232696533203
+        }
+      },
+      "cross_rate_packaged_vs_source_30hz": {
+        "rmse_nm": 0.10828641802072525,
+        "mae_nm": 0.0868474692106247,
+        "p95_abs_nm": 0.20606446266174316,
+        "max_abs_nm": 0.22593247890472412,
+        "per_side_rmse_nm": {
+          "right": 0.1068556010723114,
+          "left": 0.1096985787153244
+        }
+      },
+      "packaged_peak_abs_nm": 4.125838756561279,
+      "packaged_sampled_30hz_max_slew_nm": 0.8400002717971802,
+      "packaged_sampled_interval_max_ticks": 4,
+      "packaged_sampled_interval_allowed_slew_nm": 0.8400099999999999,
+      "package_runtime_max_slew_nm_per_100hz_step": 0.21
+    }
+  }
+}

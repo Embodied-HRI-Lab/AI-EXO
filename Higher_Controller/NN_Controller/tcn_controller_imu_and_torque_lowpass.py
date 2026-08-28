@@ -301,8 +301,15 @@ class ScriptedTCNPolicy:
             raise ValueError("scripted TCN deployment does not expose reset()")
 
         self.history_steps = int(metadata["history_steps"])
-        self.sensor_hz = int(metadata["control_hz"])
-        self.control_hz = self.sensor_hz
+        self.control_hz = int(metadata["control_hz"])
+        # A cross-rate wrapper may be called at 100 Hz while sampling its
+        # internal history at the source policy's slower training cadence.
+        # Legacy/flat packages omit this field and retain the old behavior.
+        self.sensor_hz = int(
+            metadata.get("history_sampling_hz", metadata["control_hz"])
+        )
+        if self.sensor_hz <= 0 or self.sensor_hz > self.control_hz:
+            raise ValueError("scripted TCN history sampling rate is invalid")
         self.input_channel_names = expected_inputs
         self.torque_scale_nm = float(metadata["torque_scale_nm"])
         self.mandatory_delta_nm = float(metadata["max_delta_nm_per_step"])
@@ -377,7 +384,8 @@ class ScriptedTCNPolicy:
         print(f"CONTROL: {self.control_hz} Hz")
         print(
             f"HISTORY: {self.history_steps} samples / "
-            f"{self.history_steps / self.sensor_hz:.2f} s (inside model)"
+            f"{self.history_steps / self.sensor_hz:.2f} s "
+            f"(sampled at {self.sensor_hz} Hz inside model)"
         )
         print(f"INPUT ORDER: {self.input_channel_names}")
         print(f"TORQUE COMMAND SCALE: +/-{self.torque_scale_nm:g} Nm")
