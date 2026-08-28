@@ -56,7 +56,7 @@ DEFAULT_MAX_DELTA_NM_PER_STEP = 0.8
 DEFAULT_STALE_WARNING_S = 0.050
 DEFAULT_IMU_TIMEOUT_S = 0.150
 DEFAULT_TEENSY_TIMEOUT_S = 0.200
-DEFAULT_MODEL_PATH = Path(__file__).resolve().with_name("steady_unique_100hz_20260824_124007_100hz_deploy.pt")
+DEFAULT_MODEL_PATH = Path(__file__).resolve().with_name("rampdown_weighted_activation2_thighimu_30hz_at_100hz_lzn.pt")
 SCRIPTED_METADATA_FILE = "deployment.json"
 SCRIPTED_DEPLOYMENT_FORMAT = "scripted_tcn_policy_v1"
 
