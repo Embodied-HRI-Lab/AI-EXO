@@ -59,3 +59,16 @@ motor direction, communication timeouts, and emergency-stop behavior.
 control loop. The `validation/` directory contains offline evidence and is not
 required in a minimal hardware copy. Runtime CSV files are written under
 `logs/`, which is intentionally ignored by Git.
+
+## Stair-down thigh-IMU solver candidates
+
+The three h48 stair-down candidates are under
+`models/202609011612_stairdown_solver_2x3_thighimu_h48_full4p2/`. They are
+loaded by `tcn_controller_imu_and_torque_lowpass.py`, not by
+`NN_PC_Controller.py`. Each package keeps the original 1.6-second 30-Hz
+history while being called at 100 Hz, uses standing-zeroed thigh-world IMU
+inputs, and is limited to +/-4.2 Nm with an internal 0.21 Nm/10 ms slew.
+
+These are offline solver-distilled bench candidates, not closed-loop or
+hardware-validated policies. See the model-directory README for the three
+objectives, exact commands, validation error, and safety notes.

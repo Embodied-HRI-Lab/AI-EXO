@@ -1,0 +1,60 @@
+{
+  "schema": "stairdown_solver_2x3_ai_exo_controller_validation_v1",
+  "validated_hkt": "2026-09-01T16:44:41+08:00",
+  "controller": "Higher_Controller/NN_Controller/tcn_controller_imu_and_torque_lowpass.py",
+  "command_contract": {
+    "mock_imu": true,
+    "dry_run": true,
+    "duration_seconds": 1.5,
+    "output_filter": false,
+    "maximum_controller_torque_nm": 4.2
+  },
+  "shared_checks": {
+    "controller_loads_torchscript_metadata": true,
+    "valid_inference_calls": 150,
+    "scheduled_rows_per_second": 100.0,
+    "loop_overruns": 0,
+    "history_steps": 48,
+    "dense_100hz_history_steps": 158,
+    "history_sampling_hz": 30,
+    "torque_limit_nm": 4.2,
+    "maximum_slew_nm_per_100hz_step": 0.21,
+    "initial_stationary_output_exact_zero": true,
+    "post_motion_stationary_output_returns_to_exact_zero": true,
+    "hardware_output_enabled": false
+  },
+  "models": {
+    "stairdown_hip_torque_replacement_thighimu_h48_30hz_at_100hz_lzn.pt": {
+      "sha256": "20c2f7881c1ff3f7d6ee6d9e585badaab86a4b045015f06178073807109d798f",
+      "cli_max_abs_raw_command_nm": 1.7925,
+      "cli_max_abs_slew_nm_per_step": 0.21,
+      "controller_regression_max_abs_command_nm": 1.79843,
+      "post_motion_first_exact_zero_100hz_frame": 9,
+      "mean_loop_time_ms": 0.919,
+      "p95_loop_time_ms": 0.96
+    },
+    "stairdown_activation2_thighimu_h48_30hz_at_100hz_lzn.pt": {
+      "sha256": "6305a07062f1d38a8ecaf64a87eef3c489cad6d462d4e787bfc9a3b7d89b94d4",
+      "cli_max_abs_raw_command_nm": 4.2,
+      "cli_max_abs_slew_nm_per_step": 0.21,
+      "controller_regression_max_abs_command_nm": 4.2,
+      "post_motion_first_exact_zero_100hz_frame": 26,
+      "mean_loop_time_ms": 0.91,
+      "p95_loop_time_ms": 0.936
+    },
+    "stairdown_weighted_activation2_thighimu_h48_30hz_at_100hz_lzn.pt": {
+      "sha256": "b4dd5f249649074dbd0edcda7cbd408d6b6f67e903a8167192ceaa1ada8869af",
+      "cli_max_abs_raw_command_nm": 4.1972,
+      "cli_max_abs_slew_nm_per_step": 0.21,
+      "controller_regression_max_abs_command_nm": 4.19706,
+      "post_motion_first_exact_zero_100hz_frame": 26,
+      "mean_loop_time_ms": 0.978,
+      "p95_loop_time_ms": 1.275
+    }
+  },
+  "limitations": [
+    "Mock-IMU and controller loading validation only; no motor command was enabled.",
+    "No stair-down real recording with standing-zeroed thigh-world angle was available.",
+    "No closed-loop stair simulation or hardware validation is claimed."
+  ]
+}

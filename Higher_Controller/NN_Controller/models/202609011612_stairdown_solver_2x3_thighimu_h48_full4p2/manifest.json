@@ -1,0 +1,62 @@
+{
+  "schema": "stairdown_solver_2x3_thighimu_deployment_v1",
+  "source_experiment": "/home/jimmylab/lzn/myo-exo/results/202609011612_descent_solver_2x3_thighimu_h48_full4p2_30hz",
+  "controller": "tcn_controller_imu_and_torque_lowpass.py",
+  "controller_dry_run_validation": "controller_dry_run_validation.json",
+  "terrain": "stairdown",
+  "joint_rl": false,
+  "runtime_hz": 100,
+  "training_hz": 30,
+  "history_contract": "h48 30 Hz offsets sampled from a dense 100 Hz buffer",
+  "torque_limit_nm": 4.2,
+  "model_slew_nm_per_100hz_step": 0.21,
+  "hardware_validated": false,
+  "closed_loop_validated": false,
+  "candidates": [
+    {
+      "slug": "stairdown_hip_torque_replacement",
+      "label": "下楼替代髋力矩",
+      "objective": "hip_torque_replacement",
+      "model": "stairdown_hip_torque_replacement_thighimu_h48_30hz_at_100hz_lzn.pt",
+      "bytes": 313863,
+      "sha256": "20c2f7881c1ff3f7d6ee6d9e585badaab86a4b045015f06178073807109d798f",
+      "torque_scale_nm": 4.2,
+      "max_delta_nm_per_100hz_step": 0.21,
+      "history_steps": 48,
+      "history_seconds": 1.6,
+      "validation_rmse_nm": 1.3029364049434662,
+      "hardware_validated": false,
+      "closed_loop_validated": false
+    },
+    {
+      "slug": "stairdown_activation2",
+      "label": "下楼 activation²",
+      "objective": "activation2",
+      "model": "stairdown_activation2_thighimu_h48_30hz_at_100hz_lzn.pt",
+      "bytes": 312786,
+      "sha256": "6305a07062f1d38a8ecaf64a87eef3c489cad6d462d4e787bfc9a3b7d89b94d4",
+      "torque_scale_nm": 4.2,
+      "max_delta_nm_per_100hz_step": 0.21,
+      "history_steps": 48,
+      "history_seconds": 1.6,
+      "validation_rmse_nm": 1.3080428302288056,
+      "hardware_validated": false,
+      "closed_loop_validated": false
+    },
+    {
+      "slug": "stairdown_weighted_activation2",
+      "label": "下楼 weighted activation²",
+      "objective": "weighted_activation2",
+      "model": "stairdown_weighted_activation2_thighimu_h48_30hz_at_100hz_lzn.pt",
+      "bytes": 313673,
+      "sha256": "b4dd5f249649074dbd0edcda7cbd408d6b6f67e903a8167192ceaa1ada8869af",
+      "torque_scale_nm": 4.2,
+      "max_delta_nm_per_100hz_step": 0.21,
+      "history_steps": 48,
+      "history_seconds": 1.6,
+      "validation_rmse_nm": 1.2276480495929718,
+      "hardware_validated": false,
+      "closed_loop_validated": false
+    }
+  ]
+}
