@@ -486,17 +486,17 @@ class _RawUnifiedTCNPolicy:
     def append_frame(
         self,
         left_angle_rad: float,
-        left_velocity_rad_s: float,
+        left_angular_velocity_rad_s: float,
         right_angle_rad: float,
-        right_velocity_rad_s: float,
+        right_angular_velocity_rad_s: float,
     ) -> None:
 
         frame = np.asarray(
             [
                 left_angle_rad,
-                left_velocity_rad_s,
+                left_angular_velocity_rad_s,
                 right_angle_rad,
-                right_velocity_rad_s,
+                right_angular_velocity_rad_s,
             ],
             dtype=np.float32,
         )
@@ -752,15 +752,15 @@ SCRIPTED_METADATA_FILE = "deployment.json"
 SCRIPTED_DEPLOYMENT_FORMAT = "scripted_tcn_policy_v1"
 CANONICAL_INPUT_CHANNEL_NAMES = [
     "left_thigh_angle_rad",
-    "left_thigh_velocity_rad_s",
-    "right_thigh_angle_rad",
-    "right_thigh_velocity_rad_s",
-]
-LEGACY_INPUT_CHANNEL_NAMES = [
-    "left_thigh_angle_rad",
     "left_thigh_angular_velocity_rad_s",
     "right_thigh_angle_rad",
     "right_thigh_angular_velocity_rad_s",
+]
+PACKAGED_INPUT_CHANNEL_NAMES = [
+    "left_thigh_angle_rad",
+    "left_thigh_velocity_rad_s",
+    "right_thigh_angle_rad",
+    "right_thigh_velocity_rad_s",
 ]
 
 
@@ -768,7 +768,7 @@ def _canonical_input_names(names: list[str]) -> list[str]:
     """Accept the historical velocity spelling without changing channel order."""
 
     values = [str(value) for value in names]
-    if values == LEGACY_INPUT_CHANNEL_NAMES:
+    if values == PACKAGED_INPUT_CHANNEL_NAMES:
         return list(CANONICAL_INPUT_CHANNEL_NAMES)
     return values
 
@@ -867,16 +867,16 @@ class _ScriptedTCNPolicy:
     def append_frame(
         self,
         left_angle_rad: float,
-        left_velocity_rad_s: float,
+        left_angular_velocity_rad_s: float,
         right_angle_rad: float,
-        right_velocity_rad_s: float,
+        right_angular_velocity_rad_s: float,
     ) -> None:
         frame = np.asarray(
             [
                 left_angle_rad,
-                left_velocity_rad_s,
+                left_angular_velocity_rad_s,
                 right_angle_rad,
-                right_velocity_rad_s,
+                right_angular_velocity_rad_s,
             ],
             dtype=np.float32,
         )

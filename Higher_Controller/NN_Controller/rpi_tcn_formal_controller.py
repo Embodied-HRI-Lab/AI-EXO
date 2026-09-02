@@ -96,9 +96,9 @@ MODEL_PATH = (
 
 EXPECTED_INPUTS = [
     "left_thigh_angle_rad",
-    "left_thigh_velocity_rad_s",
+    "left_thigh_angular_velocity_rad_s",
     "right_thigh_angle_rad",
-    "right_thigh_velocity_rad_s",
+    "right_thigh_angular_velocity_rad_s",
 ]
 
 
@@ -1162,10 +1162,10 @@ def main() -> None:
             writer.writerow(
                 [
                     "timestamp",
-                    "left_angle_rad",
-                    "left_velocity_rad_s",
-                    "right_angle_rad",
-                    "right_velocity_rad_s",
+                    "left_thigh_angle_rad",
+                    "left_thigh_angular_velocity_rad_s",
+                    "right_thigh_angle_rad",
+                    "right_thigh_angular_velocity_rad_s",
                     "left_raw_tcn_nm",
                     "right_raw_tcn_nm",
                     "left_cmd_nm",
